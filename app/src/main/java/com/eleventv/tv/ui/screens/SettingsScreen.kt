@@ -406,6 +406,25 @@ fun SettingsScreen(
                         style = T.Body2,
                         color = C.Text2,
                     )
+
+                    // 数据来源声明。
+                    //
+                    // 这不是客套话：TMDB 的 API 使用条款要求必须写明「产品使用了 TMDB API，
+                    // 但未获得 TMDB 认可或认证」，Fanart.tv 同样要求署名。删掉这两行就等于
+                    // 违反使用条款——而条款被判定违规的后果就是 key 被封，整个刮削直接失效。
+                    VSpace(D.Xl)
+                    TvText("数据来源", style = T.Label, color = C.Text3)
+                    VSpace(D.Xs)
+                    InfoRow("TMDB", "影片信息、评分与海报。本产品使用 TMDB API，但未获得 TMDB 认可或认证。")
+                    InfoRow("Fanart.tv", "部分剧照与背景图。图片版权归原作者所有。")
+                    VSpace(D.Xs)
+                    TvText(
+                        // TMDB 品牌规范里指定的原句，保留英文原文便于对照
+                        text = "This product uses the TMDB API but is not endorsed or certified by TMDB.",
+                        style = T.Caption,
+                        color = C.Text3,
+                        maxLines = 2,
+                    )
                 }
             }
         }
