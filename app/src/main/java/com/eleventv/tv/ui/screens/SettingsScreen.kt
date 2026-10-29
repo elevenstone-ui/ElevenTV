@@ -375,7 +375,7 @@ fun SettingsScreen(
                         Column {
                             TvText("ElevenTV", style = T.Title1, color = C.Text1)
                             TvText(
-                                text = "版本 ${BuildConfig.VERSION_NAME}",
+                                text = "版本 ${BuildConfig.VERSION_NAME} · 构建 ${BuildConfig.BUILD_STAMP}",
                                 style = T.Caption,
                                 color = C.Text3,
                             )
@@ -383,7 +383,7 @@ fun SettingsScreen(
                     }
                     VSpace(D.Lg)
                     TvText(
-                        text = "只读取局域网 SMB 共享上的视频，数据全部保存在本机。刮削时仅把片名发送给数据源，不上传任何文件。",
+                        text = "支持局域网 SMB 与 WebDAV 两种网络存储，数据全部保存在本机。刮削时仅把片名发送给数据源，不上传任何文件。",
                         style = T.Body2,
                         color = C.Text2,
                     )
@@ -535,11 +535,11 @@ private fun ServerBlock(
         Column(modifier = Modifier.weight(1f)) {
             TvText(server.name, style = T.Body2, color = C.Text1, maxLines = 1)
             TvText(
-                // SMB 用 UNC 形态 `\\host\share\path`，WebDAV 用 URL 形态——混着写会让用户
-                // 以为「我的 WebDAV 地址填错了」
+                // 协议名打头：同一台 NAS 的 SMB 与 WebDAV 条目地址形态不同（UNC vs URL），
+                // 不标明时两个条目看起来一模一样，选错了表现就是「一直转圈」。
                 text = when (server.protocol) {
-                    StorageProtocol.SMB -> "\\\\${server.display}\\${server.share}"
-                    StorageProtocol.WEBDAV -> server.baseUrl
+                    StorageProtocol.SMB -> "SMB · \\\\${server.display}\\${server.share}"
+                    StorageProtocol.WEBDAV -> "WebDAV · ${server.baseUrl}"
                 } + server.roots.takeIf { it.isNotEmpty() }
                     ?.joinToString("、") { root ->
                         val sep = if (server.protocol == StorageProtocol.SMB) "\\" else "/"

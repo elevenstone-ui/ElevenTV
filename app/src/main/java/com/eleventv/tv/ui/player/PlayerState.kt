@@ -779,8 +779,14 @@ class PlayerState(
                 // 「已读 1.2 MB」这种早已过时的数字，用户没法判断到底还在不在读
                 val now = System.currentTimeMillis()
                 if (waited > 6_000 && now - hintAt > 2_000) {
-                    // WebDAV 下统计为空（走 Media3 的 HTTP 栈），别把空串塞给界面
-                    bufferHint = SmbIoStats.summary().ifBlank { null }
+                    // 提示里必须带协议名：SMB 有字节统计，WebDAV 走 Media3 的 HTTP 栈没有统计。
+                    // 不带协议名时，「0.5 MB / 1 次」这种字样看不出走的是哪条链路，
+                    // 排查时只能靠猜（曾经把 SMB 旧包误当成 WebDAV 版）。
+                    bufferHint = if (SmbIoStats.active) {
+                        SmbIoStats.summary().ifBlank { null }?.let { "SMB · $it" }
+                    } else {
+                        "WebDAV 直连 · 已等待 ${waited / 1000}s"
+                    }
                     hintAt = now
                 }
                 if (!stallReported && waited > STALL_TIMEOUT_MS &&
