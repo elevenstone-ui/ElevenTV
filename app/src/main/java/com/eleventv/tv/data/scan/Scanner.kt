@@ -6,12 +6,9 @@ import com.eleventv.tv.data.model.LibraryEntry
 import com.eleventv.tv.data.model.MediaFile
 import com.eleventv.tv.data.model.MediaKind
 import com.eleventv.tv.data.model.SmbServer
-import com.eleventv.tv.data.model.StorageProtocol
+import com.eleventv.tv.data.smb.SmbConnection
+import com.eleventv.tv.data.smb.SmbEntry
 import com.eleventv.tv.data.smb.SmbPool
-import com.eleventv.tv.data.smb.SmbStorage
-import com.eleventv.tv.data.storage.RemoteEntry
-import com.eleventv.tv.data.storage.RemoteStorage
-import com.eleventv.tv.data.webdav.WebDavStorage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -40,13 +37,10 @@ data class ScanResult(
 )
 
 /**
- * 媒体库扫描（SMB / WebDAV 共用）。
+ * SMB 媒体库扫描。
  *
  * 按服务器逐个走目录树，把视频文件解析成 [MediaFile]，再按剧名聚合成 [LibraryEntry]。
  * 只读目录，不改动 NAS 上任何文件。
- *
- * 目录访问抽象成 [RemoteStorage]：协议差异（握手、认证、列目录的请求形态）全部留在
- * 各自的实现里，这一层只管「遍历 + 解析 + 归并」。
  */
 class Scanner(private val pool: SmbPool) {
 
@@ -103,7 +97,7 @@ class Scanner(private val pool: SmbPool) {
         for (server in servers.filter { it.enabled }) {
             val counter = intArrayOf(0)
 
-            val onFile: (RemoteEntry, String, MediaKind?) -> Unit = { entry, relPath, kindOverride ->
+            val onFile: (SmbEntry, String, MediaKind?) -> Unit = { entry, relPath, kindOverride ->
                 coroutineContext.ensureActive()
                 counter[0]++
 
@@ -140,15 +134,8 @@ class Scanner(private val pool: SmbPool) {
                 }
             }
 
-            failedDirs += when (server.protocol) {
-                // SMB：连接由池管理，用完归还（不关闭）
-                StorageProtocol.SMB -> pool.with(server) { conn ->
-                    walkRoots(SmbStorage(conn), server, onFile)
-                }
-                // WebDAV：一次性客户端，用完即弃——它没有需要复用的长连接
-                StorageProtocol.WEBDAV -> WebDavStorage(server).use { dav ->
-                    walkRoots(dav, server, onFile)
-                }
+            failedDirs += pool.with(server) { conn ->
+                walkRoots(conn, server, onFile)
             }
 
             scanned += counter[0]
@@ -203,13 +190,13 @@ class Scanner(private val pool: SmbPool) {
      * @return 读取失败的目录数
      */
     private fun walkRoots(
-        storage: RemoteStorage,
+        conn: SmbConnection,
         server: SmbServer,
-        onFile: (RemoteEntry, String, MediaKind?) -> Unit,
+        onFile: (SmbEntry, String, MediaKind?) -> Unit,
     ): Int {
         var failed = 0
         for (root in server.roots) {
-            failed += walk(storage, root.path, depth = 0) { entry, relPath ->
+            failed += walk(conn, root.path, depth = 0) { entry, relPath ->
                 onFile(entry, relPath, root.kind)
             }
         }
@@ -222,13 +209,13 @@ class Scanner(private val pool: SmbPool) {
      * @return 读取失败的目录数（含递归下去的）
      */
     private fun walk(
-        storage: RemoteStorage,
+        conn: SmbConnection,
         path: String,
         depth: Int,
-        onFile: (RemoteEntry, String) -> Unit,
+        onFile: (SmbEntry, String) -> Unit,
     ): Int {
         if (depth > MAX_DEPTH) return 0
-        val items = runCatching { storage.list(path) }.getOrElse { e ->
+        val items = runCatching { conn.list(path) }.getOrElse { e ->
             Log.w(TAG, "跳过目录 $path：${e.message}")
             return 1
         }
@@ -239,7 +226,7 @@ class Scanner(private val pool: SmbPool) {
             if (item.name.lowercase() in SKIP_DIRS) continue
 
             val child = if (path.isBlank()) item.name else "$path/${item.name}"
-            if (item.isDirectory) failed += walk(storage, child, depth + 1, onFile) else onFile(item, child)
+            if (item.isDirectory) failed += walk(conn, child, depth + 1, onFile) else onFile(item, child)
         }
         return failed
     }

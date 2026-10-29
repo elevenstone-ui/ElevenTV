@@ -92,7 +92,7 @@ fun HomeScreen(
             // 没有服务器：引导去设置
             libraryEmpty && !hasServers -> StateView(
                 title = "还没有配置媒体库",
-                description = "ElevenTV 只读取局域网 NAS 上的视频。先在设置里添加 NAS（SMB 或 WebDAV），再扫描媒体库。",
+                description = "ElevenTV 只读取局域网 NAS 上的视频。先在设置里添加 SMB 服务器，再扫描媒体库。",
                 iconRes = R.drawable.ic_storage,
                 brand = true,
                 action = {

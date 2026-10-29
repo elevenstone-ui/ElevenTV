@@ -215,40 +215,14 @@ object MediaRootSerializer : KSerializer<MediaRoot> {
     }
 }
 
-/**
- * 连接协议。
- *
- * [SMB] 走 smbj 私有栈；[WEBDAV] 走标准 HTTP，取流交给 Media3 自带的 `HttpDataSource`。
- * 后者的价值不在「功能更多」，而在**连接管理是别人写的**：重连、退避、Range 断点续传
- * 都不需要自己维护——SMB 那边每一条都要手写，且每次 NAS 抖动都要重新调参。
- */
-@Serializable
-enum class StorageProtocol {
-    SMB,
-    WEBDAV;
-
-    val label: String
-        get() = when (this) {
-            SMB -> "SMB"
-            WEBDAV -> "WebDAV"
-        }
-
-    /** 该协议的默认端口 */
-    val defaultPort: Int
-        get() = when (this) {
-            SMB -> 445
-            WEBDAV -> 5005
-        }
-}
-
-/** 网络存储服务器配置（SMB 或 WebDAV）。 */
+/** SMB 服务器配置。 */
 @Serializable
 data class SmbServer(
     val id: String,
     val name: String,
     val host: String,
     val port: Int = 445,
-    /** 共享名，如 `media`、`video`；WebDAV 下不使用（恒为空） */
+    /** 共享名，如 `media`、`video` */
     val share: String,
     val username: String = "",
     val password: String = "",
@@ -263,40 +237,8 @@ data class SmbServer(
      */
     val mediaRoots: List<MediaRoot> = emptyList(),
     val enabled: Boolean = true,
-    // ---- 以下仅 WebDAV 使用 ----
-    /** 连接协议。默认 SMB：旧配置反序列化后行为完全不变 */
-    val protocol: StorageProtocol = StorageProtocol.SMB,
-    /** 走 HTTPS。仅 WebDAV 有效；局域网自签证书无法验证，通常直接用 HTTP */
-    val tls: Boolean = false,
-    /** WebDAV 路径前缀（如 `/media`），空 = 服务器根 */
-    val basePath: String = "",
 ) {
     val display: String get() = if (port == 445) host else "$host:$port"
-
-    /**
-     * WebDAV 根 URL。
-     *
-     * 端口按协议补默认值：从 SMB 切到 WebDAV 却没改端口时，`port` 还停在 445，
-     * 直接拼进 URL 就是个必然连不上的地址——所以协议与端口不匹配时按标准端口算。
-     */
-    val baseUrl: String
-        get() {
-            val scheme = if (tls) "https" else "http"
-            val standard = if (tls) 443 else 80
-            val p = if (port == 445) standard else port
-            val root = encodeUrlPath(basePath.trim('/'))
-            return buildString {
-                append(scheme).append("://").append(host.trim())
-                if (p != standard) append(':').append(p)
-                if (root.isNotEmpty()) append('/').append(root)
-            }
-        }
-
-    /** 共享内相对路径 → 完整的 WebDAV 文件 URL */
-    fun davUrl(relPath: String): String {
-        val clean = encodeUrlPath(relPath.trim('/'))
-        return if (clean.isEmpty()) "$baseUrl/" else "$baseUrl/$clean"
-    }
 
     /** 实际生效的扫描根：mediaRoots 优先，依次回落到旧字段 */
     val roots: List<MediaRoot>
@@ -306,21 +248,6 @@ data class SmbServer(
                 rootPaths.map { MediaRoot(it.trim('/')) }.filter { it.path.isNotBlank() }
             }
             .ifEmpty { listOf(MediaRoot(rootPath.trim('/'))) }
-
-    companion object {
-        /**
-         * 逐段百分号编码。
-         *
-         * 不能整串 `URLEncoder.encode`：那会把 `/` 也编成 `%2F`，所有多级目录全部 404。
-         * 也不能完全不编：中文剧名、空格、`#`、`?` 在文件名里都很常见，不编就是 400 或串味。
-         */
-        internal fun encodeUrlPath(path: String): String =
-            path.split('/').joinToString("/") { seg ->
-                java.net.URLEncoder.encode(seg, "UTF-8")
-                    .replace("+", "%20")
-                    .replace("%2F", "/")
-            }
-    }
 }
 
 /** 单个媒体文件（一集或一部电影）。 */

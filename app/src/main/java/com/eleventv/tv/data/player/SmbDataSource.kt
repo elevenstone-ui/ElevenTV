@@ -33,19 +33,10 @@ object SmbIoStats {
 
     /** 本次播放里「连接断了又接回来」的次数：>0 说明网络/NAS 不稳，但播放已被兜住 */
     @Volatile var reconnects = 0
-
-    /**
-     * 当前播放是否走 SMB 数据源。
-     *
-     * WebDAV 走 Media3 自带的 HttpDataSource，字节数不经过这里——不标记的话，
-     * `bytesRead` 恒为 0，缓冲卡住时会把「HTTP 慢」误报成「SMB 一个字节都没读到」。
-     */
-    @Volatile var active = false
     @Volatile var lastError: String? = null
 
     @Synchronized
-    fun reset(active: Boolean = true) {
-        this.active = active
+    fun reset() {
         bytesRead = 0
         readCalls = 0
         openCalls = 0
@@ -56,7 +47,6 @@ object SmbIoStats {
     }
 
     fun summary(): String = when {
-        !active -> ""
         bytesRead <= 0 ->
             "本次读取 0 字节（打开 ${openCalls} 次，耗时 ${openCostMs}ms" +
                 (lastError?.let { "，最后错误：${it.take(60)}" } ?: "") + "）"

@@ -32,7 +32,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import com.eleventv.tv.data.model.StorageProtocol
 import com.eleventv.tv.ui.design.C
 import com.eleventv.tv.ui.design.D
 import com.eleventv.tv.ui.design.T
@@ -244,48 +243,5 @@ fun SettingsCard(
         TvText(title, style = T.Title2, color = C.Text1)
         VSpace(D.Lg)
         content()
-    }
-}
-
-/**
- * 协议选择。
- *
- * TV 上没有下拉框的习惯：遥控器在一排选项里左右移动比「弹出再选择」少两步，
- * 所以用两颗按钮，选中态直接换主色。
- */
-@Composable
-fun ProtocolPicker(
-    selected: StorageProtocol,
-    onSelect: (StorageProtocol) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Row(
-        modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(D.Lg),
-    ) {
-        TvText(
-            text = "协议",
-            style = T.Body2,
-            color = C.Text2,
-            modifier = Modifier.width(56.dp),
-            maxLines = 1,
-        )
-        StorageProtocol.entries.forEach { p ->
-            TvButton(
-                onClick = { onSelect(p) },
-                label = p.label,
-                variant = if (p == selected) TvButtonVariant.Primary else TvButtonVariant.Ghost,
-            )
-        }
-        TvText(
-            text = when (selected) {
-                StorageProtocol.SMB -> "端口 445"
-                StorageProtocol.WEBDAV -> "HTTP · 默认 5005"
-            },
-            style = T.Caption,
-            color = C.Text3,
-            maxLines = 1,
-        )
     }
 }

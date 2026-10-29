@@ -43,11 +43,9 @@ import com.eleventv.tv.R
 import com.eleventv.tv.data.model.MediaKind
 import com.eleventv.tv.data.model.MediaRoot
 import com.eleventv.tv.data.model.SmbServer
-import com.eleventv.tv.data.model.StorageProtocol
 import com.eleventv.tv.data.smb.SmbEntry
 import com.eleventv.tv.ui.components.BrandLogo
 import com.eleventv.tv.ui.components.ChoiceRow
-import com.eleventv.tv.ui.components.ProtocolPicker
 import com.eleventv.tv.ui.components.TvButton
 import com.eleventv.tv.ui.components.TvButtonVariant
 import com.eleventv.tv.ui.components.TvText
@@ -61,7 +59,7 @@ import kotlinx.coroutines.launch
 import java.util.UUID
 
 /**
- * 添加 NAS（SMB / WebDAV）引导。
+ * 添加 SMB 服务器引导。
  *
  * 只在「一个服务器都没有」时出现。两步：
  * 1. 填连接参数 → 测试连接（必须成功才能继续）
@@ -84,11 +82,9 @@ fun OnboardingScreen(
 
     var step by remember { mutableIntStateOf(0) }
     var name by remember { mutableStateOf("") }
-    var protocol by remember { mutableStateOf(StorageProtocol.SMB) }
     var host by remember { mutableStateOf("") }
-    var port by remember { mutableStateOf(StorageProtocol.SMB.defaultPort.toString()) }
+    var port by remember { mutableStateOf("445") }
     var share by remember { mutableStateOf("") }
-    var basePath by remember { mutableStateOf("") }
     var user by remember { mutableStateOf("") }
     var pass by remember { mutableStateOf("") }
 
@@ -112,19 +108,15 @@ fun OnboardingScreen(
         id = serverId,
         name = name.trim().ifBlank { host.trim() },
         host = host.trim(),
-        port = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: protocol.defaultPort,
-        // 切到 WebDAV 也不清空：share 同时是文件 id 的一段，清掉等于整库换 id
+        port = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: 445,
         share = share.trim().trim('/'),
         username = user.trim(),
         password = pass,
         rootPath = "",
-        protocol = protocol,
-        basePath = if (protocol == StorageProtocol.WEBDAV) basePath.trim().trim('/') else "",
         mediaRoots = selected.value.sorted().map { MediaRoot(it, kindOf.value[it]) },
     )
 
-    val valid = host.isNotBlank() &&
-        (protocol == StorageProtocol.WEBDAV || share.isNotBlank())
+    val valid = host.isNotBlank() && share.isNotBlank()
 
     fun loadDir(path: String) {
         browsing = true
@@ -180,23 +172,12 @@ fun OnboardingScreen(
                 ConnectionForm(
                     name = name,
                     onName = { name = it },
-                    protocol = protocol,
-                    onProtocol = { picked ->
-                        if (picked != protocol) {
-                            if (port.toIntOrNull() == protocol.defaultPort) port = picked.defaultPort.toString()
-                            protocol = picked
-                            tested = false
-                            error = null
-                        }
-                    },
                     host = host,
                     onHost = { host = it; tested = false; error = null },
                     port = port,
                     onPort = { port = it; tested = false },
                     share = share,
                     onShare = { share = it; tested = false; error = null },
-                    basePath = basePath,
-                    onBasePath = { basePath = it; tested = false; error = null },
                     user = user,
                     onUser = { user = it },
                     pass = pass,
@@ -257,12 +238,12 @@ private fun IntroPanel(modifier: Modifier = Modifier) {
         TvText("连接你的 NAS", style = T.Headline, color = C.Text1)
         VSpace(D.Xl)
         TvText(
-            text = "ElevenTV 只读取局域网里 SMB 共享或 WebDAV 目录上的视频，不上传、不转码、不依赖任何在线服务。",
+            text = "ElevenTV 只读取局域网里 SMB 共享上的视频，不上传、不转码、不依赖任何在线服务。",
             style = T.Body2,
             color = C.Text2,
         )
         VSpace(D.X2l)
-        IntroBullet("1", "选协议（SMB / WebDAV），填地址与路径")
+        IntroBullet("1", "填写 NAS 的地址与共享名")
         IntroBullet("2", "浏览并勾选要收录的目录，可多选")
         IntroBullet("3", "给每个目录指定类型（Movie → 电影）")
     }
@@ -306,16 +287,12 @@ private fun StepDots(step: Int) {
 private fun ConnectionForm(
     name: String,
     onName: (String) -> Unit,
-    protocol: StorageProtocol,
-    onProtocol: (StorageProtocol) -> Unit,
     host: String,
     onHost: (String) -> Unit,
     port: String,
     onPort: (String) -> Unit,
     share: String,
     onShare: (String) -> Unit,
-    basePath: String,
-    onBasePath: (String) -> Unit,
     user: String,
     onUser: (String) -> Unit,
     pass: String,
@@ -329,8 +306,6 @@ private fun ConnectionForm(
     LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        ProtocolPicker(selected = protocol, onSelect = onProtocol)
-        VSpace(D.Xl)
         Row(horizontalArrangement = Arrangement.spacedBy(D.Lg)) {
             Box(Modifier.weight(1f)) {
                 TvTextField(
@@ -346,7 +321,7 @@ private fun ConnectionForm(
                     value = port,
                     onValueChange = onPort,
                     label = "端口",
-                    placeholder = protocol.defaultPort.toString(),
+                    placeholder = "445",
                     numberOnly = true,
                 )
             }
@@ -354,31 +329,12 @@ private fun ConnectionForm(
 
         VSpace(D.Xl)
 
-        if (protocol == StorageProtocol.SMB) {
-            TvTextField(
-                value = share,
-                onValueChange = onShare,
-                label = "共享名",
-                placeholder = "media",
-            )
-        } else {
-            TvTextField(
-                value = basePath,
-                onValueChange = onBasePath,
-                label = "路径前缀（可留空）",
-                placeholder = "留空 = 服务器根，如 media",
-            )
-            VSpace(D.Sm)
-            // 填共享名而不是留空：留空会把根下所有共享（含 Download、home）一起扫进来，
-            // 而且文件相对路径会多出一层共享名，与 SMB 时期的路径对不上
-            TvText(
-                text = "前缀填共享文件夹名（如 media）。威联通在「控制台 → 应用服务 → WebDAV」启用，" +
-                    "端口 5005（HTTP）/ 5006（HTTPS）",
-                style = T.Caption,
-                color = C.Text3,
-                maxLines = 2,
-            )
-        }
+        TvTextField(
+            value = share,
+            onValueChange = onShare,
+            label = "共享名",
+            placeholder = "media",
+        )
 
         VSpace(D.Xl)
 
@@ -444,7 +400,7 @@ private fun ConnectionForm(
             )
             if (!valid) {
                 TvText(
-                    text = if (protocol == StorageProtocol.WEBDAV) "地址为必填" else "地址与共享名为必填",
+                    text = "地址与共享名为必填",
                     style = T.Caption,
                     color = C.Text3,
                     maxLines = 1,

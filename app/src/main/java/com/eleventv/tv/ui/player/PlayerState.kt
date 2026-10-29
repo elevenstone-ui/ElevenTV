@@ -11,7 +11,6 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.core.net.toUri
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -21,7 +20,6 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
-import androidx.media3.datasource.DefaultHttpDataSource
 import com.eleventv.tv.data.player.SmbIoStats
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -32,11 +30,9 @@ import com.eleventv.tv.data.model.AppSettings
 import com.eleventv.tv.data.model.Decoder
 import com.eleventv.tv.data.model.LibraryEntry
 import com.eleventv.tv.data.model.MediaFile
-import com.eleventv.tv.data.model.StorageProtocol
 import com.eleventv.tv.data.player.SmbDataSource
 import com.eleventv.tv.data.repo.LocalRepository
 import com.eleventv.tv.data.repo.episodeLabel
-import com.eleventv.tv.data.webdav.davRequestHeaders
 import java.util.Locale
 
 /** OSD 的四种形态。 */
@@ -635,16 +631,7 @@ class PlayerState(
         // 没有服务器时也允许建播放器：构造函数里要先能拿到 player 才能报错，
         // 直接抛异常会让 Activity 起不来，用户连「为什么播不了」都看不到
         server?.let {
-            val factory: DataSource.Factory = when (it.protocol) {
-                StorageProtocol.SMB -> SmbDataSource.Factory(repo.smb, it)
-                // WebDAV 直接用 Media3 的 HTTP 栈：重连、退避、Range 断点续传都由它负责，
-                // 数据源这一层不再有任何自研代码
-                StorageProtocol.WEBDAV -> DefaultHttpDataSource.Factory()
-                    .setDefaultRequestProperties(it.davRequestHeaders())
-                    .setUserAgent(HTTP_USER_AGENT)
-                    .setConnectTimeoutMs(HTTP_CONNECT_TIMEOUT_MS)
-                    .setReadTimeoutMs(HTTP_READ_TIMEOUT_MS)
-            }
+            val factory: DataSource.Factory = SmbDataSource.Factory(repo.smb, it)
             builder.setMediaSourceFactory(DefaultMediaSourceFactory(factory))
         }
 
@@ -716,20 +703,16 @@ class PlayerState(
         bitmapCues = emptyList()
         // 旧片的宽高比不能留给新片用，否则缓冲期间会按上一部画错
         videoAspect = null
-        SmbIoStats.reset(active = srv.protocol == StorageProtocol.SMB)
+        SmbIoStats.reset()
         stallSince = 0L
         stallReported = false
         errorFromStall = false
 
-        val uri = when (srv.protocol) {
-            StorageProtocol.SMB -> android.net.Uri.Builder()
-                .scheme("smb")
-                .authority(srv.id)
-                .path(target.path)
-                .build()
-            // WebDAV：真实 URL 直接交给 HttpDataSource，路径里的中文/空格已在 davUrl 里编码
-            StorageProtocol.WEBDAV -> srv.davUrl(target.path).toUri()
-        }
+        val uri = android.net.Uri.Builder()
+            .scheme("smb")
+            .authority(srv.id)
+            .path(target.path)
+            .build()
 
         player.setMediaItem(MediaItem.fromUri(uri))
         player.prepare()
@@ -779,23 +762,16 @@ class PlayerState(
                 // 「已读 1.2 MB」这种早已过时的数字，用户没法判断到底还在不在读
                 val now = System.currentTimeMillis()
                 if (waited > 6_000 && now - hintAt > 2_000) {
-                    // WebDAV 下统计为空（走 Media3 的 HTTP 栈），别把空串塞给界面
-                    bufferHint = SmbIoStats.summary().ifBlank { null }
+                    bufferHint = SmbIoStats.summary()
                     hintAt = now
                 }
-                if (!stallReported && waited > STALL_TIMEOUT_MS &&
-                    (!SmbIoStats.active || SmbIoStats.bytesRead <= 0)
-                ) {
+                if (!stallReported && waited > STALL_TIMEOUT_MS && SmbIoStats.bytesRead <= 0) {
                     stallReported = true
                     // 标记来源：这类错误是「等太久」推断出来的，连接一旦自己恢复就该撤掉。
                     // 播放器自己报的错（onPlayerError）是终局，不能这么撤。
                     errorFromStall = true
-                    val tail = if (SmbIoStats.active) {
-                        "${SmbIoStats.summary()}。可重试；若反复如此，检查 NAS 是否休眠或网络是否稳定。"
-                    } else {
-                        "可重试；若反复如此，检查 NAS 是否休眠、WebDAV 服务是否正常。"
-                    }
-                    error = "读取超时：12 秒没有收到任何数据。$tail"
+                    error = "读取超时：12 秒没有收到任何数据。${SmbIoStats.summary()}。" +
+                        "可重试；若反复如此，检查 NAS 是否休眠或网络是否稳定。"
                     Log.w(TAG, "读取超时：${SmbIoStats.summary()}")
                 } else if (waited / 5_000 != (waited - TICK_MS) / 5_000) {
                     Log.i(TAG, "仍在缓冲 ${waited / 1000}s：${SmbIoStats.summary()}")
@@ -936,16 +912,6 @@ class PlayerState(
 
         /** 取流类错误自动重试前的静置时间：留一点时间让连接池把死连接收干净 */
         const val AUTO_RETRY_DELAY_MS = 1_000L
-
-        /**
-         * WebDAV 的 HTTP 超时。
-         *
-         * 连接 15 秒：局域网握手正常在 50ms 内，15 秒已经等于「主机不可达」；
-         * 读 30 秒：NAS 机械盘唤醒要 5~8 秒，留足余量，又不至于让一次哑读卡死整个播放。
-         */
-        const val HTTP_CONNECT_TIMEOUT_MS = 15_000
-        const val HTTP_READ_TIMEOUT_MS = 30_000
-        const val HTTP_USER_AGENT = "ElevenTV/2.0"
 
         val CONSUMED_KEYS = setOf(
             KeyEvent.KEYCODE_DPAD_CENTER,

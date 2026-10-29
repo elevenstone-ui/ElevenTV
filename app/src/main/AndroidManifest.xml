@@ -25,11 +25,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ElevenTV"
-        tools:ignore="DataExtractionRules"
-        tools:targetApi="28"
-        android:usesCleartextTraffic="true">
-        <!-- 明文 HTTP 只用于局域网 WebDAV（群晖默认 5005）。targetSdk 28 起系统默认禁止，
-             而 NAS 的自签证书又过不了 HTTPS 校验，所以这里放开；SMB 与刮削不受影响。 -->
+        tools:ignore="DataExtractionRules">
 
         <activity
             android:name=".MainActivity"

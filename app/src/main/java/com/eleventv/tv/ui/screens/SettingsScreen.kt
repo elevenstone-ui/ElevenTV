@@ -35,14 +35,12 @@ import com.eleventv.tv.data.model.JobState
 import com.eleventv.tv.data.model.JobStatus
 import com.eleventv.tv.data.model.MediaRoot
 import com.eleventv.tv.data.model.SmbServer
-import com.eleventv.tv.data.model.StorageProtocol
 import com.eleventv.tv.ui.components.BrandLogo
 import com.eleventv.tv.ui.components.ChoiceRow
 import com.eleventv.tv.ui.components.ConfirmDialog
 import com.eleventv.tv.ui.components.InfoRow
 import com.eleventv.tv.ui.components.InputDialog
 import com.eleventv.tv.ui.components.MessageDialog
-import com.eleventv.tv.ui.components.ProtocolPicker
 import com.eleventv.tv.ui.components.SettingsCard
 import com.eleventv.tv.ui.components.ToggleRow
 import com.eleventv.tv.ui.components.TvButton
@@ -149,7 +147,7 @@ fun SettingsScreen(
 
             // ---------------- 服务器 ----------------
             item("servers") {
-                SettingsCard(title = "网络存储（SMB / WebDAV）") {
+                SettingsCard(title = "SMB 服务器") {
                     if (servers.isEmpty()) {
                         TvText(
                             text = "还没有服务器。添加后才能扫描媒体库。",
@@ -535,15 +533,9 @@ private fun ServerBlock(
         Column(modifier = Modifier.weight(1f)) {
             TvText(server.name, style = T.Body2, color = C.Text1, maxLines = 1)
             TvText(
-                // SMB 用 UNC 形态 `\\host\share\path`，WebDAV 用 URL 形态——混着写会让用户
-                // 以为「我的 WebDAV 地址填错了」
-                text = when (server.protocol) {
-                    StorageProtocol.SMB -> "\\\\${server.display}\\${server.share}"
-                    StorageProtocol.WEBDAV -> server.baseUrl
-                } + server.roots.takeIf { it.isNotEmpty() }
+                text = "\\\\${server.display}\\${server.share}" + server.roots.takeIf { it.isNotEmpty() }
                     ?.joinToString("、") { root ->
-                        val sep = if (server.protocol == StorageProtocol.SMB) "\\" else "/"
-                        sep + root.path.replace("/", sep) +
+                        "\\" + root.path.replace("/", "\\") +
                             (root.kind?.let { "（${it.label}）" } ?: "")
                     }
                     .orEmpty(),
@@ -614,13 +606,9 @@ private fun ServerEditorDialog(
     val scope = rememberCoroutineScope()
 
     var name by remember(initial) { mutableStateOf(initial?.name.orEmpty()) }
-    var protocol by remember(initial) { mutableStateOf(initial?.protocol ?: StorageProtocol.SMB) }
     var host by remember(initial) { mutableStateOf(initial?.host.orEmpty()) }
-    var port by remember(initial) {
-        mutableStateOf((initial?.port ?: protocol.defaultPort).toString())
-    }
+    var port by remember(initial) { mutableStateOf((initial?.port ?: 445).toString()) }
     var share by remember(initial) { mutableStateOf(initial?.share.orEmpty()) }
-    var basePath by remember(initial) { mutableStateOf(initial?.basePath.orEmpty()) }
     var user by remember(initial) { mutableStateOf(initial?.username.orEmpty()) }
     var pass by remember(initial) { mutableStateOf(initial?.password.orEmpty()) }
     // 多目录的类型映射在引导页完成；弹窗里只维护路径的快速编辑，
@@ -634,15 +622,10 @@ private fun ServerEditorDialog(
         id = initial?.id ?: ("srv-" + UUID.randomUUID().toString().take(8)),
         name = name.trim().ifBlank { host.trim() },
         host = host.trim(),
-        port = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: protocol.defaultPort,
-        // 切到 WebDAV 时**不清空** share：它虽然不再参与连接，但它是文件 id 的一段
-        // （`serverId|share|path`）。清掉会让整库的 id 全变，播放记录随之失联。
-        // 隐藏字段留着当 id 盐，是这里唯一刻意的取舍。
+        port = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: 445,
         share = share.trim().trim('/'),
         username = user.trim(),
         password = pass,
-        protocol = protocol,
-        basePath = if (protocol == StorageProtocol.WEBDAV) basePath.trim().trim('/') else "",
         mediaRoots = root.split('、')
             .map { it.trim().trim('/') }
             .filter { it.isNotBlank() }
@@ -650,9 +633,7 @@ private fun ServerEditorDialog(
             .map { path -> MediaRoot(path, initial?.roots?.firstOrNull { it.path == path }?.kind) },
     )
 
-    // WebDAV 不需要共享名（路径直接在 URL 里），所以必填项随协议变
-    val valid = host.isNotBlank() &&
-        (protocol == StorageProtocol.WEBDAV || share.isNotBlank())
+    val valid = host.isNotBlank() && share.isNotBlank()
 
     TvDialog(
         title = if (initial == null) "添加服务器" else "编辑服务器",
@@ -696,27 +677,6 @@ private fun ServerEditorDialog(
             }
         },
     ) {
-        ProtocolPicker(
-            selected = protocol,
-            onSelect = { picked ->
-                if (picked != protocol) {
-                    // 端口还停在旧协议的默认值时才跟着切，用户手填过的端口不动
-                    if (port.toIntOrNull() == protocol.defaultPort) port = picked.defaultPort.toString()
-                    // SMB → WebDAV 时用共享名兜底路径前缀。
-                    //
-                    // NAS 的 WebDAV 把「共享文件夹」暴露成根下的第一层，所以共享名就是天然的
-                    // 前缀。不补这一层，文件相对路径会从 `剧集/Show/01.mkv` 变成
-                    // `media/剧集/Show/01.mkv`——扫描后文件 id 全变，播放记录、已刮削的
-                    // 海报与简介全部对不上（id 由 serverId|share|path 派生）。
-                    if (picked == StorageProtocol.WEBDAV && basePath.isBlank() && share.isNotBlank()) {
-                        basePath = share.trim('/')
-                    }
-                    protocol = picked
-                    error = null
-                }
-            },
-        )
-        VSpace(D.Lg)
         Row(horizontalArrangement = Arrangement.spacedBy(D.Lg)) {
             Box(Modifier.weight(1f)) {
                 TvTextField(value = host, onValueChange = { host = it }, label = "地址", placeholder = "192.168.1.10")
@@ -726,16 +686,7 @@ private fun ServerEditorDialog(
             }
         }
         VSpace(D.Lg)
-        if (protocol == StorageProtocol.SMB) {
-            TvTextField(value = share, onValueChange = { share = it }, label = "共享名", placeholder = "media")
-        } else {
-            TvTextField(
-                value = basePath,
-                onValueChange = { basePath = it },
-                label = "路径前缀（可留空）",
-                placeholder = "留空 = 服务器根，如 media",
-            )
-        }
+        TvTextField(value = share, onValueChange = { share = it }, label = "共享名", placeholder = "media")
         VSpace(D.Lg)
         Row(horizontalArrangement = Arrangement.spacedBy(D.Lg)) {
             Box(Modifier.weight(1f)) {

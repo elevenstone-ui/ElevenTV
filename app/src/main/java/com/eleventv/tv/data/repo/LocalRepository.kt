@@ -13,7 +13,6 @@ import com.eleventv.tv.data.model.MediaKind
 import com.eleventv.tv.data.model.PlaybackRecord
 import com.eleventv.tv.data.model.Row
 import com.eleventv.tv.data.model.SmbServer
-import com.eleventv.tv.data.model.StorageProtocol
 import com.eleventv.tv.data.scan.Scanner
 import com.eleventv.tv.data.scrape.Scraper
 import com.eleventv.tv.data.scrape.TmdbSource
@@ -21,7 +20,6 @@ import com.eleventv.tv.data.smb.SmbEntry
 import com.eleventv.tv.data.smb.SmbPool
 import com.eleventv.tv.data.store.JsonStore
 import com.eleventv.tv.data.store.SecretBox
-import com.eleventv.tv.data.webdav.WebDavStorage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -139,18 +137,10 @@ class LocalRepository(
     override suspend fun testServer(server: SmbServer): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             // 每个媒体库根目录都要实际列一次：某个根填错了当场暴露，不留到扫描时才发现
-            when (server.protocol) {
-                StorageProtocol.SMB -> server.roots.forEach { root ->
-                    pool.with(server) { conn ->
-                        val items = conn.list(root.path)
-                        Log.i(TAG, "连接成功：${server.display}/${server.share} 根「${root.path}」${items.size} 项")
-                    }
-                }
-                StorageProtocol.WEBDAV -> WebDavStorage(server).use { dav ->
-                    server.roots.forEach { root ->
-                        val items = dav.list(root.path)
-                        Log.i(TAG, "连接成功：${server.baseUrl} 根「${root.path}」${items.size} 项")
-                    }
+            server.roots.forEach { root ->
+                pool.with(server) { conn ->
+                    val items = conn.list(root.path)
+                    Log.i(TAG, "连接成功：${server.display}/${server.share} 根「${root.path}」${items.size} 项")
                 }
             }
             Unit
@@ -159,23 +149,7 @@ class LocalRepository(
 
     override suspend fun browse(server: SmbServer, path: String): Result<List<SmbEntry>> =
         withContext(Dispatchers.IO) {
-            runCatching {
-                when (server.protocol) {
-                    StorageProtocol.SMB -> pool.with(server) { conn -> conn.list(path) }
-                    // 引导页的目录选择对两种协议共用：统一成 SmbEntry（只是字段容器）
-                    StorageProtocol.WEBDAV -> WebDavStorage(server).use { dav ->
-                        dav.list(path).map {
-                            SmbEntry(
-                                name = it.name,
-                                isDirectory = it.isDirectory,
-                                sizeBytes = it.sizeBytes,
-                                modifiedAt = it.modifiedAt,
-                                createdAt = it.createdAt,
-                            )
-                        }
-                    }
-                }
-            }
+            runCatching { pool.with(server) { conn -> conn.list(path) } }
         }
 
     override suspend fun saveServer(server: SmbServer) = withContext(Dispatchers.IO) {
