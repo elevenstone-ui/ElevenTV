@@ -224,24 +224,36 @@ private fun SubtitleLayer(state: PlayerState, bottomPadding: Dp) {
     if (lines.isEmpty() && bitmaps.isEmpty()) return
 
     // 字号跟随设置（tokens 的 Title1 是标准档，其他档按倍数缩放）
-    val style = T.Title1.copy(fontSize = T.Title1.fontSize * state.subtitleScale)
+    //
+    // 行高必须跟着一起放大：Title1 的 lineHeight 只有 20sp，而字号放到 1.5× 就已 25.5sp，
+    // 两行字幕的行盒比字还矮，会上下叠字——倍数越大叠得越厉害。以前「特大」只放大
+    // fontSize，就是这个毛病；再往 2.6× 走会糊成一团，所以这里两个值必须同比例。
+    val scale = state.subtitleScale
+    val style = T.Title1.copy(
+        fontSize = T.Title1.fontSize * scale,
+        lineHeight = T.Title1.lineHeight * scale,
+    )
+    // 两侧留白按倍数收窄：固定 96dp 在巨大档下会把长句挤成四五行，贴上画面上下沿
+    val sideInset = (96.dp / scale).coerceIn(32.dp, 96.dp)
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .padding(bottom = bottomPadding, start = 96.dp, end = 96.dp),
+            .padding(bottom = bottomPadding, start = sideInset, end = sideInset),
         contentAlignment = Alignment.BottomCenter,
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             // 位图字幕（PGS / VOBSUB）：本身就是「已经排版好的画面」，直接当图贴，
-            // 不画底衬、不加字距——原图带着描边与阴影，再压一层黑底反而脏
+            // 不画底衬、不加字距——原图带着描边与阴影，再压一层黑底反而脏。
+            // 但它也得跟着档位放大，否则「调大字幕」对蓝光 REMUX 完全无效；
+            // 上限 100% 即还原原始尺寸（原图本就按画面宽度排的）。
             if (bitmaps.isNotEmpty()) {
                 bitmaps.forEach { bitmap ->
                     androidx.compose.foundation.Image(
                         bitmap = bitmap.asImageBitmap(),
                         contentDescription = null,
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxWidth(0.72f),
+                        modifier = Modifier.fillMaxWidth((0.72f * scale).coerceIn(0.72f, 1f)),
                     )
                 }
             }

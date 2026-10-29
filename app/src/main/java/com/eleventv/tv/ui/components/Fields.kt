@@ -22,6 +22,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
@@ -38,6 +39,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.eleventv.tv.data.model.StorageProtocol
 import com.eleventv.tv.ui.design.C
@@ -197,9 +199,10 @@ fun SwitchTrack(checked: Boolean, modifier: Modifier = Modifier) {
 }
 
 /**
- * 单选行：2–4 个选项横向铺开，选中段白底黑字。
+ * 单选行：2–6 个选项横向铺开，选中段白底黑字。
  *
- * 超过 4 项或文案过长时应该改用列表，这里不做自动降级——调用方决定。
+ * 再多或文案过长时应该改用列表，这里不做自动降级——调用方决定。
+ * （6 个两字选项约 300dp，放进设置卡片仍留得下半屏，不会把左侧标题挤没。）
  */
 @Composable
 fun ChoiceRow(
@@ -238,6 +241,64 @@ fun ChoiceRow(
                 }
             }
         }
+    }
+}
+
+/**
+ * 字幕样式预览。
+ *
+ * 字号只能在「真实尺寸」下判断：设置页里一行字看着够大，坐到三米外完全不是那么回事，
+ * 于是每次都得进播放页试、退出来改。这里按播放页**完全相同**的算法画两句样品
+ * （Title1 × 倍数、行高同步缩放、底衬不透明度），看到的就是电视上会看到的。
+ *
+ * 两句而不是一句：行距是「小字号刚好、大字号叠字」的翻车点，一行样品看不出来。
+ */
+@Composable
+fun SubtitlePreview(
+    scale: Float,
+    bgAlpha: Float,
+    modifier: Modifier = Modifier,
+) {
+    val base = T.Title1
+    // 与 PlayerScreen.SubtitleLayer 保持一致（含行高缩放），改那边记得同步这里
+    val style = base.copy(
+        fontSize = base.fontSize * scale,
+        lineHeight = base.lineHeight * scale,
+    )
+    val ratio = if (scale == scale.toInt().toFloat()) "${scale.toInt()}×" else "${scale}×"
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(148.dp)
+            // 先裁再画底：字号调到最大时文字会顶到边框，溢出会在卡片上留下字影
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFF0B0D10)),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(bottom = 14.dp),
+        ) {
+            listOf("这就是电视上的字幕大小", "第二行用来看行距").forEach { line ->
+                Box(
+                    modifier = Modifier
+                        .padding(vertical = 1.dp)
+                        .background(Color.Black.copy(alpha = bgAlpha), RoundedCornerShape(4.dp))
+                        .padding(horizontal = D.Md, vertical = 3.dp),
+                ) {
+                    TvText(text = line, style = style, color = Color.White, textAlign = TextAlign.Center)
+                }
+            }
+        }
+        TvText(
+            text = ratio,
+            style = T.Caption,
+            color = C.Text3,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(horizontal = D.Lg, vertical = D.Md),
+        )
     }
 }
 

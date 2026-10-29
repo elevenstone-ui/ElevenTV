@@ -282,8 +282,13 @@ class PlayerState(
         start(file, positionMs)
     }
 
-    /** 设置里的字幕字号倍数，夹在可视范围内防止调出屏外 */
-    val subtitleScale: Float get() = settings.subtitleSizeScale.coerceIn(0.6f, 2f)
+    /**
+     * 设置里的字幕字号倍数，夹在可视范围内防止调出屏外。
+     *
+     * 上限跟着设置里的最大档走（2.6×），这里留到 3.0 而不是恰好等于它：
+     * 以后再加一档时忘了改这里，表现是「选了没反应」，比直接夹死更难查。
+     */
+    val subtitleScale: Float get() = settings.subtitleSizeScale.coerceIn(0.6f, 3f)
 
     /** 字幕底衬不透明度 */
     val subtitleBgAlpha: Float get() = settings.subtitleBgAlpha.coerceIn(0f, 1f)

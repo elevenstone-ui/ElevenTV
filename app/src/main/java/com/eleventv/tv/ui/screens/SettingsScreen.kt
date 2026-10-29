@@ -44,6 +44,7 @@ import com.eleventv.tv.ui.components.InputDialog
 import com.eleventv.tv.ui.components.MessageDialog
 import com.eleventv.tv.ui.components.ProtocolPicker
 import com.eleventv.tv.ui.components.SettingsCard
+import com.eleventv.tv.ui.components.SubtitlePreview
 import com.eleventv.tv.ui.components.ToggleRow
 import com.eleventv.tv.ui.components.TvButton
 import com.eleventv.tv.ui.components.TvButtonVariant
@@ -311,12 +312,17 @@ fun SettingsScreen(
                         onToggle = { onUpdateSettings { s -> s.copy(autoNextEpisode = !s.autoNextEpisode) } },
                     )
                     ChoiceRow(
+                        // 原来的上限 1.5×（约 25sp）在三米外仍然偏小，用户反馈「特大不够大」。
+                        // 上限放到 2.6×（约 44sp，1080p 下约占画面高度 8%），并补「超大/巨大」
+                        // 两档——中间不留 0.5 的跳档，遥控器左右两下就能找到合适的那一档。
                         label = "字幕字号",
                         options = listOf(
                             "0.85" to "小",
                             "1.0" to "标准",
                             "1.25" to "大",
                             "1.5" to "特大",
+                            "2.0" to "超大",
+                            "2.6" to "巨大",
                         ),
                         selectedId = settings.subtitleSizeScale.toString(),
                         onSelect = { id ->
@@ -337,6 +343,19 @@ fun SettingsScreen(
                         onSelect = { id ->
                             onUpdateSettings { s -> s.copy(subtitleBgAlpha = id.toFloatOrNull() ?: 0.6f) }
                         },
+                    )
+                    VSpace(D.Md)
+                    // 在设置页里按真实尺寸预演：不然只能「进播放页看 → 退出 → 改 → 再看」
+                    SubtitlePreview(
+                        scale = settings.subtitleSizeScale,
+                        bgAlpha = settings.subtitleBgAlpha,
+                    )
+                    VSpace(D.Sm)
+                    TvText(
+                        text = "上面的字号就是播放时的实际大小，坐到沙发上看一眼再定。" +
+                            "字幕位置固定贴底，调到「巨大」也不会被裁掉。",
+                        style = T.Caption,
+                        color = C.Text3,
                     )
                     VSpace(D.Xs)
                     TvText(
