@@ -26,8 +26,10 @@ android {
         // A9F 出厂 Android 8.0（API 26）；26 起自适应图标可用
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "2.0.2"
+        // SMB 分支独立版本号：两种协议的功能已经分叉，装在同一台电视上时
+        // 「关于」里必须能一眼分出是哪一版（2.0.2 曾经同时对应过两个包）
+        versionCode = 9
+        versionName = "2.1.5-smb"
 
         buildConfigField("String", "TMDB_API_KEY", "\"$tmdbApiKey\"")
         buildConfigField("String", "TMDB_READ_TOKEN", "\"$tmdbReadToken\"")
