@@ -34,6 +34,61 @@ fun SmbServer.davRequestHeaders(): Map<String, String> =
     davAuthHeader()?.let { mapOf("Authorization" to it) } ?: emptyMap()
 
 /**
+ * 404 的自诊断：把「到底哪一层错了」写进错误信息。
+ *
+ * 404 有四种完全不同的成因，只给一句「路径不存在」，用户只能反复改、反复试：
+ *
+ * 1. **共享名大小写不对**——WebDAV 的路径区分大小写，SMB 不区分。
+ *    SMB 里 `\\nas\multimedia` 能进，WebDAV 里 `/multimedia` 未必存在（真名可能是 `Multimedia`）。
+ *    这是从 SMB 切过来最容易踩的一个坑，而且报错完全一样。
+ * 2. **共享没开 WebDAV 访问权**——威联通默认不勾，表现出来也是 404。
+ * 3. **共享对，是「起始目录」写错了**——这种情况能列出真实子目录名，比任何文案都管用。
+ * 4. 端口打到了别的东西上（那种一般是 405 或返回 HTML，走不到这里）。
+ *
+ * 只在「测试并保存」失败时调用，扫描路径上不做这些额外请求。
+ */
+fun SmbServer.davNotFoundHint(): String {
+    val base = basePath.trim('/')
+    if (base.isBlank()) return ""
+
+    // 第一种：共享目录本身能列 → 错的只是「起始目录」。把真实子目录摊给用户
+    val children = runCatching { WebDavStorage(this).use { it.list("") } }.getOrNull()
+    if (children != null) {
+        val dirs = children.filter { it.isDirectory }.map { it.name }.sorted()
+        if (dirs.isEmpty()) return "；共享目录「$base」下没有子目录，「起始目录」应该留空"
+        val shown = dirs.take(8).joinToString("、") + if (dirs.size > 8) " 等 ${dirs.size} 个" else ""
+        val wrong = roots.map { it.path }.filter { it.isNotBlank() && dirs.none { d -> d == it } }
+        return if (wrong.isEmpty()) {
+            "；共享目录「$base」可访问，子目录：$shown"
+        } else {
+            "；共享目录「$base」可访问，但没有 ${wrong.joinToString("、")}。实际的子目录：$shown"
+        }
+    }
+
+    // 第二种：换大小写能通 → 就是名字写法的问题
+    val first = base.substringBefore('/')
+    val variants = listOf(
+        first.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.lowercase() },
+        first.lowercase(),
+        first.uppercase(),
+    ).distinct().filter { it != first }
+
+    for (candidate in variants) {
+        val probe = copy(basePath = base.replaceFirst(first, candidate))
+        val ok = runCatching { WebDavStorage(probe).use { it.list("") } }.isSuccess
+        if (ok) {
+            return "；但「$candidate」可以连上——WebDAV 路径区分大小写（SMB 不区分），" +
+                "把路径前缀改成「$candidate」即可"
+        }
+    }
+
+    // 第三种：同名的都连不上 → 共享没开 WebDAV 访问权
+    return "；共享目录「$first」无法通过 WebDAV 访问：威联通需在" +
+        "「控制台 → 权限 → 共享文件夹 → 编辑共享文件夹 → WebDAV 访问权限」勾选该共享" +
+        "（只开 WebDAV 服务、不给共享授权，表现出来就是 404）"
+}
+
+/**
  * WebDAV 目录访问。
  *
  * ## 只需实现一件事：PROPFIND

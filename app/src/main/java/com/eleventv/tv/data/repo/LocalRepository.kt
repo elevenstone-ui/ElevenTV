@@ -21,6 +21,8 @@ import com.eleventv.tv.data.smb.SmbEntry
 import com.eleventv.tv.data.smb.SmbPool
 import com.eleventv.tv.data.store.JsonStore
 import com.eleventv.tv.data.store.SecretBox
+import com.eleventv.tv.data.webdav.DavException
+import com.eleventv.tv.data.webdav.davNotFoundHint
 import com.eleventv.tv.data.webdav.WebDavStorage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -147,9 +149,17 @@ class LocalRepository(
                     }
                 }
                 StorageProtocol.WEBDAV -> WebDavStorage(server).use { dav ->
-                    server.roots.forEach { root ->
-                        val items = dav.list(root.path)
-                        Log.i(TAG, "连接成功：${server.baseUrl} 根「${root.path}」${items.size} 项")
+                    try {
+                        server.roots.forEach { root ->
+                            val items = dav.list(root.path)
+                            Log.i(TAG, "连接成功：${server.baseUrl} 根「${root.path}」${items.size} 项")
+                        }
+                    } catch (e: DavException) {
+                        // 404 时补一段「到底哪一层错了」的诊断，别让用户对着同一个报错反复改
+                        if (e.notFound) {
+                            throw DavException((e.message.orEmpty() + server.davNotFoundHint()), e)
+                        }
+                        throw e
                     }
                 }
             }

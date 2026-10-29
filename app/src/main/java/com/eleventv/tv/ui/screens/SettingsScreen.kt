@@ -763,8 +763,9 @@ private fun ServerEditorDialog(
 
         error?.let {
             VSpace(D.Lg)
-            // 4 行：WebDAV 的报错带「请求 URL」，两行会被截断，而截掉的正好是能拿去浏览器验证的那串
-            TvText(it, style = T.Caption, color = C.Error, maxLines = 4)
+            // 6 行：WebDAV 的 404 诊断会把「实际可用的子目录/大小写」一并带出来，
+            // 4 行不够，截掉的正好是最有用的那半句
+            TvText(it, style = T.Caption, color = C.Error, maxLines = 6)
         }
     }
 }
