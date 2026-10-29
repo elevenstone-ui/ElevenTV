@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ElevenTV 标志矢量版 · 应用内使用（导航栏 / 启动页 / 空态）
+     几何与 icon/render.html 完全一致：512 视口，圆角 118，双竖条 66×256 r33，倾斜 -9°
+     注意：渐变填充需要 AAPT2，最低 API 24；目标机 A9F 为 API 26，可用 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+
+    <!-- 圆角方形底 -->
+    <path
+        android:pathData="M118,0H394A118,118 0 0 1 512,118V394A118,118 0 0 1 394,512H118A118,118 0 0 1 0,394V118A118,118 0 0 1 118,0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="0"
+                android:startY="0"
+                android:endX="512"
+                android:endY="512">
+                <item android:offset="0" android:color="#FF7C5CFF" />
+                <item android:offset="0.52" android:color="#FFA04AF0" />
+                <item android:offset="1" android:color="#FFFF4E9B" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 左竖条 -->
+    <group
+        android:pivotX="199"
+        android:pivotY="256"
+        android:rotation="-9">
+        <path
+            android:pathData="M166,161A33,33 0 0 1 232,161V351A33,33 0 0 1 166,351Z"
+            android:fillColor="#FFFFFFFF" />
+    </group>
+
+    <!-- 右竖条 -->
+    <group
+        android:pivotX="313"
+        android:pivotY="256"
+        android:rotation="-9">
+        <path
+            android:pathData="M280,161A33,33 0 0 1 346,161V351A33,33 0 0 1 280,351Z"
+            android:fillColor="#FFFFFFFF" />
+    </group>
+
+</vector>

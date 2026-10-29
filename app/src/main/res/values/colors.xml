@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动底色：取自 Leanback banner 的深紫底，与 banner 衔接，不用系统默认蓝 -->
+    <color name="brand_splash">#FF2B1240</color>
+</resources>

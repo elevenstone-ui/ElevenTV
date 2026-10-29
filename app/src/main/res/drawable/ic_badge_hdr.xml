@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HDR 角标（线稿字标）。
+
+  用矢量而不是文字：角标要跟着海报一起缩放，9sp 的中文「HDR10+」在 120dp 的卡上
+  既挤又糊；矢量字标在任何密度下都是同一条轮廓，缩放不会出现二次采样毛边。
+  描边纯白，颜色由 Compose 的 tint 决定。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="32dp"
+    android:height="14dp"
+    android:viewportWidth="32"
+    android:viewportHeight="14">
+    <path
+        android:pathData="M2,2 L2,12 M9,2 L9,12 M2,7 L9,7"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.2" />
+    <path
+        android:pathData="M13,2 L13,12 M13,2 L16.2,2 A5,5 0 0 1 16.2,12 L13,12"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.2" />
+    <path
+        android:pathData="M23,12 L23,2 L26.4,2 A3.6,3.6 0 0 1 26.4,9.2 L23,9.2 M26.4,9.2 L30,12"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.2" />
+</vector>

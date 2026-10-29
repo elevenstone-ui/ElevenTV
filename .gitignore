@@ -1,0 +1,15 @@
+*.iml
+.gradle/
+.kotlin/
+local.properties
+keystore.properties
+*.jks
+*.keystore
+.idea/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+.DS_Store
+# 产物目录：APK、源码包、审查报告都不进版本库
+outputs/

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 系统启动窗口背景：深紫底 + 居中品牌标志。
+     冷启动时 Compose 首帧要等一会儿才画出来（电视盒子几百毫秒到一两秒），
+     这段时间屏幕上只有 windowBackground —— 纯色的话用户盯着紫屏，很像卡死。
+     把标志画进窗口背景，品牌视觉从第一帧就在，Compose 接管时无缝衔接。
+
+     两条硬约束，改动时别破坏：
+     1. 尺寸必须等于 D.LogoMarkSplash（96dp）；
+     2. 位置必须是屏幕正中（gravity=center），与 Compose 层的对齐方式一致，
+        否则窗口交接的瞬间 LOGO 会跳一下。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/brand_splash" />
+    <item
+        android:width="96dp"
+        android:height="96dp"
+        android:gravity="center"
+        android:drawable="@drawable/ic_logo_mark" />
+</layer-list>

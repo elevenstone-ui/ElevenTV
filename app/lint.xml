@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!--
+      mipmap-anydpi-v26 是自适应图标的唯一合法位置：minSdk 26 之后
+      Android 8.0 也需要这一份，lint 认为「v26 限定符多余」是误判。
+    -->
+    <issue id="ObsoleteSdkInt">
+        <ignore path="src/main/res/mipmap-anydpi-v26" />
+    </issue>
+
+    <!--
+      banner.png 只有一份 320×180（Leanback 主屏横幅的固定尺寸）。
+      复制到其他密度目录会被按密度解释成不同的物理尺寸，反而在部分机型上变形。
+    -->
+    <issue id="IconMissingDensityFolder">
+        <ignore path="src/main/res" />
+    </issue>
+</lint>

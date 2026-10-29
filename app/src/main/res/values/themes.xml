@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ElevenTV.Base" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/brand_splash</item>
+        <!-- 启动窗口与系统启动动画（扩散圆）的取色：与 banner 深紫底 #2B1240 同源 -->
+        <item name="android:colorPrimary">@color/brand_splash</item>
+        <item name="android:colorPrimaryDark">@color/brand_splash</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDisablePreview">false</item>
+    </style>
+
+    <style name="Theme.ElevenTV" parent="Theme.ElevenTV.Base" />
+
+    <!--
+      入口页专用：启动窗口带品牌标志。
+
+      只有 MainActivity 用。播放器仍走 Theme.ElevenTV 的纯色背景 ——
+      从首页进播放器时如果也闪一下 LOGO，观感是「又要重新启动一次」。
+    -->
+    <style name="Theme.ElevenTV.Launcher" parent="Theme.ElevenTV">
+        <item name="android:windowBackground">@drawable/splash_brand</item>
+    </style>
+</resources>

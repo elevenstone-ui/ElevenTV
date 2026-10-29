@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+ 启动画面：底色与图标背后那颗圆都取 #2B1240 -->
+    <style name="Theme.ElevenTV" parent="Theme.ElevenTV.Base">
+        <item name="android:windowSplashScreenBackground">@color/brand_splash</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/brand_splash</item>
+    </style>
+</resources>

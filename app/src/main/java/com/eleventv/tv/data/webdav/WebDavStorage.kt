@@ -1,0 +1,266 @@
+package com.eleventv.tv.data.webdav
+
+import android.util.Base64
+import android.util.Log
+import android.util.Xml
+import com.eleventv.tv.data.model.SmbServer
+import com.eleventv.tv.data.storage.RemoteEntry
+import com.eleventv.tv.data.storage.RemoteStorage
+import org.xmlpull.v1.XmlPullParser
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URI
+import java.net.URL
+import java.net.URLDecoder
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+
+/** WebDAV 请求失败。区分「配置错了」与「网络抖了」：前者不该重试，后者值得再试一次 */
+class DavException(
+    message: String,
+    cause: Throwable? = null,
+    val retryable: Boolean = false,
+    val notFound: Boolean = false,
+) : IOException(message, cause)
+
+/** Basic 认证头；用户名为空表示匿名访问（不少 NAS 的 WebDAV 允许） */
+fun SmbServer.davAuthHeader(): String? {
+    if (username.isBlank()) return null
+    val raw = "$username:$password".toByteArray(Charsets.UTF_8)
+    return "Basic " + Base64.encodeToString(raw, Base64.NO_WRAP)
+}
+
+/** 播放端用：Media3 的 HttpDataSource 只需要这一组默认请求头 */
+fun SmbServer.davRequestHeaders(): Map<String, String> =
+    davAuthHeader()?.let { mapOf("Authorization" to it) } ?: emptyMap()
+
+/**
+ * WebDAV 目录访问。
+ *
+ * ## 只需实现一件事：PROPFIND
+ *
+ * 播放不需要走这里——`DefaultHttpDataSource` 直接用 GET + Range 读文件，
+ * 断线重连、跳转、`Content-Length` 处理全由 Media3 负责。这个类只服务于
+ * 「扫描」和「选目录」两个动作，因此保持得足够薄。
+ *
+ * ## 为什么不用 PROPFIND 的 allprop
+ *
+ * `allprop` 会让服务器把所有属性都吐一遍（含 `supportedlock` 之类的长 XML），
+ * 一部剧几千集时响应体积能到几 MB。只点名要四个属性。
+ */
+class WebDavStorage(private val server: SmbServer) : RemoteStorage {
+
+    override val label: String get() = server.baseUrl
+
+    override fun list(path: String): List<RemoteEntry> {
+        val url = server.davUrl(path)
+        var attempt = 0
+        while (true) {
+            try {
+                return request(url, depth = 1)
+            } catch (e: DavException) {
+                if (!e.retryable || attempt >= 1) throw e
+            } catch (e: IOException) {
+                // 局域网瞬时抖动：第二次通常就过了。配置类错误已在上面按 notFound/权限分流
+                if (attempt >= 1) throw e
+            }
+            attempt++
+            Log.w(TAG, "PROPFIND 重试一次：$url")
+        }
+    }
+
+    override fun close() = Unit
+
+    // ---------------- HTTP ----------------
+
+    private fun request(url: String, depth: Int, hop: Int = 0): List<RemoteEntry> {
+        val body = PROPFIND_BODY.toByteArray(Charsets.UTF_8)
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "PROPFIND"
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+            instanceFollowRedirects = false
+            setFixedLengthStreamingMode(body.size)
+            doOutput = true
+            setRequestProperty("Depth", depth.toString())
+            setRequestProperty("Content-Type", "application/xml; charset=utf-8")
+            setRequestProperty("Accept", "application/xml")
+            server.davAuthHeader()?.let { setRequestProperty("Authorization", it) }
+        }
+
+        try {
+            conn.outputStream.use { it.write(body) }
+            val code = conn.responseCode
+
+            // PROPFIND 不是 GET，Java 的自动跳转不会生效；补 `/` 或 http→https 的跳转得自己跟
+            if (code in REDIRECTS && hop < 2) {
+                val location = conn.getHeaderField("Location")
+                if (!location.isNullOrBlank()) {
+                    val next = runCatching { URI(url).resolve(location).toString() }.getOrNull()
+                    if (!next.isNullOrBlank()) return request(next, depth, hop + 1)
+                }
+            }
+
+            when (code) {
+                in 200..299 -> Unit
+                401 -> throw DavException(
+                    "WebDAV 认证失败（401）：检查用户名与密码" +
+                        if (server.username.isBlank()) "——当前未填写用户名" else "",
+                )
+                403 -> throw DavException("WebDAV 无权限（403）：该账号不能访问 ${server.basePath.ifBlank { "/" }}")
+                404 -> throw DavException("WebDAV 路径不存在（404）：检查${PATH_HINT}", notFound = true)
+                405 -> throw DavException(
+                    "该地址不支持 WebDAV（405）：端口可能填成了管理后台或 SMB 端口" +
+                        "——WebDAV 默认端口 5005（HTTP）/ 5006（HTTPS），" +
+                        "威联通需先在「控制台 → 应用服务 → WebDAV」启用",
+                )
+                409 -> throw DavException("WebDAV 冲突（409）：路径不是目录")
+                423 -> throw DavException("WebDAV 资源被锁定（423）")
+                500, 502, 503, 504 -> throw DavException("WebDAV 服务暂不可用（HTTP $code）", retryable = true)
+                else -> throw DavException("WebDAV 请求失败（HTTP $code）")
+            }
+
+            return conn.inputStream.use { parse(it, url) }
+        } catch (e: DavException) {
+            throw e
+        } catch (e: javax.net.ssl.SSLHandshakeException) {
+            throw DavException(
+                "HTTPS 证书校验失败：NAS 多为自签证书，改用 HTTP（关掉 TLS）即可",
+                e,
+            )
+        } catch (e: java.net.SocketTimeoutException) {
+            throw DavException("WebDAV 连接超时（${CONNECT_TIMEOUT_MS / 1000} 秒）：检查地址与端口", e, retryable = true)
+        } catch (e: java.net.ConnectException) {
+            throw DavException("连不上 ${server.host}:${server.port}：检查 NAS 是否在线、端口是否放行", e, retryable = true)
+        } finally {
+            runCatching { conn.disconnect() }
+        }
+    }
+
+    // ---------------- XML ----------------
+
+    private fun parse(input: java.io.InputStream, requestUrl: String): List<RemoteEntry> {
+        val selfPath = runCatching { URI(requestUrl).path.orEmpty().trimEnd('/') }.getOrDefault("")
+
+        val parser = Xml.newPullParser()
+        // 开命名空间：各家 NAS 的前缀五花八门（`D:`、`d:`、`lp1:`、无前缀），
+        // 关掉的话 `parser.name` 会带回前缀，逐个前缀去匹配是不可能的。
+        // 打开后拿到的就是本地名（`resourcetype`）。
+        parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+        parser.setInput(input, null)
+
+        val out = ArrayList<RemoteEntry>()
+        var href: String? = null
+        var isDir = false
+        var size = 0L
+        var modified = 0L
+        var created = 0L
+        var inResponse = false
+
+        var event = parser.eventType
+        while (event != XmlPullParser.END_DOCUMENT) {
+            when (event) {
+                XmlPullParser.START_TAG -> when (parser.name.lowercase()) {
+                    "response" -> {
+                        inResponse = true
+                        href = null
+                        isDir = false
+                        size = 0L
+                        modified = 0L
+                        created = 0L
+                    }
+                    "href" -> if (inResponse) href = parser.nextText().trim()
+                    "collection" -> if (inResponse) isDir = true
+                    "getcontentlength" -> if (inResponse) size = parser.nextText().trim().toLongOrNull() ?: 0L
+                    "getlastmodified" -> if (inResponse) modified = parseHttpDate(parser.nextText().trim())
+                    "creationdate" -> if (inResponse) created = parseIsoDate(parser.nextText().trim())
+                }
+                XmlPullParser.END_TAG -> if (parser.name.lowercase() == "response" && inResponse) {
+                    inResponse = false
+                    val link = href
+                    if (link != null) {
+                        val path = decodedPath(link, requestUrl)
+                        // 第一项永远是目录自己（Depth:1 的语义），它不是「子项」
+                        val isSelf = path.trimEnd('/') == selfPath
+                        val name = path.trimEnd('/').substringAfterLast('/')
+                        if (!isSelf && name.isNotEmpty()) {
+                            out += RemoteEntry(
+                                name = name,
+                                isDirectory = isDir || path.endsWith("/"),
+                                sizeBytes = size,
+                                modifiedAt = modified,
+                                createdAt = created,
+                            )
+                        }
+                    }
+                }
+            }
+            event = parser.next()
+        }
+        return out
+    }
+
+    /**
+     * href → 解码后的路径。
+     *
+     * 服务器可能给三种形态：绝对 URL、绝对路径、相对名。统一成路径后再取末段当文件名。
+     * 用 [URI.getPath] 而不是 `URLDecoder`：后者会把文件名里的 `+` 解码成空格，
+     * `EP01+SP.mkv` 这类名字会直接对不上。
+     */
+    private fun decodedPath(href: String, requestUrl: String): String {
+        val raw = runCatching { URI(href).path.orEmpty() }
+            .getOrElse { runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href) }
+        return when {
+            raw.isBlank() -> ""
+            raw.startsWith("/") -> raw
+            href.contains("://") -> raw
+            else -> runCatching { URI(requestUrl).path.orEmpty().trimEnd('/') + "/" + raw }.getOrDefault(raw)
+        }
+    }
+
+    private fun parseHttpDate(text: String): Long {
+        if (text.isBlank()) return 0L
+        val formats = listOf(
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEE, dd MMM yyyy HH:mm:ss Z",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+        )
+        for (pattern in formats) {
+            val value = runCatching {
+                SimpleDateFormat(pattern, Locale.US).apply {
+                    timeZone = TimeZone.getTimeZone("GMT")
+                    isLenient = false
+                }.parse(text)?.time
+            }.getOrNull()
+            if (value != null) return value
+        }
+        return 0L
+    }
+
+    private fun parseIsoDate(text: String): Long {
+        if (text.isBlank()) return 0L
+        return runCatching { java.time.Instant.parse(text).toEpochMilli() }
+            .getOrElse { parseHttpDate(text) }
+    }
+
+    private companion object {
+        const val TAG = "ElevenTV"
+        const val CONNECT_TIMEOUT_MS = 10_000
+        const val READ_TIMEOUT_MS = 30_000
+        const val PATH_HINT = " 路径前缀（basePath）是否与 NAS 上的共享目录一致"
+        val REDIRECTS = setOf(301, 302, 303, 307, 308)
+
+        val PROPFIND_BODY = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <d:propfind xmlns:d="DAV:">
+              <d:prop>
+                <d:resourcetype/>
+                <d:getcontentlength/>
+                <d:getlastmodified/>
+                <d:creationdate/>
+              </d:prop>
+            </d:propfind>
+        """.trimIndent()
+    }
+}
