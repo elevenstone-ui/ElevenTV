@@ -72,7 +72,7 @@ import java.util.UUID
  */
 @Composable
 fun OnboardingScreen(
-    onTest: suspend (SmbServer) -> Result<Unit>,
+    onTest: suspend (SmbServer) -> Result<SmbServer>,
     onSave: (SmbServer) -> Unit,
     onBrowse: suspend (SmbServer, String) -> Result<List<SmbEntry>>,
     modifier: Modifier = Modifier,
@@ -147,7 +147,10 @@ fun OnboardingScreen(
         scope.launch {
             val result = onTest(buildServer())
             testing = false
-            result.onSuccess {
+            result.onSuccess { ok ->
+                // 测试可能把路径大小写改成了服务器上的实际写法，表单要跟着变：
+                // 不跟就会「测试通过、保存的却是原来那份错的」
+                if (ok.basePath != basePath) basePath = ok.basePath
                 tested = true
                 step = 1
                 loadDir("")

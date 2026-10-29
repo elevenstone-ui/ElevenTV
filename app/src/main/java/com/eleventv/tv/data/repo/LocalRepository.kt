@@ -23,6 +23,7 @@ import com.eleventv.tv.data.store.JsonStore
 import com.eleventv.tv.data.store.SecretBox
 import com.eleventv.tv.data.webdav.DavException
 import com.eleventv.tv.data.webdav.davNotFoundHint
+import com.eleventv.tv.data.webdav.davRepairCase
 import com.eleventv.tv.data.webdav.WebDavStorage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -138,32 +139,60 @@ class LocalRepository(
 
     // ---------------- 服务器 ----------------
 
-    override suspend fun testServer(server: SmbServer): Result<Unit> = withContext(Dispatchers.IO) {
+    /**
+     * 测试连接。
+     *
+     * 返回的**不一定是传进来的那台服务器**：WebDAV 的路径区分大小写，404 时会自动
+     * 换大小写再试，试通了就把修好的那份返回给调用方保存。调用方要保存返回值，
+     * 而不是自己手里那份原始参数，否则「测试通过」与「实际存下的配置」会不一致。
+     */
+    override suspend fun testServer(server: SmbServer): Result<SmbServer> = withContext(Dispatchers.IO) {
         runCatching {
-            // 每个媒体库根目录都要实际列一次：某个根填错了当场暴露，不留到扫描时才发现
             when (server.protocol) {
-                StorageProtocol.SMB -> server.roots.forEach { root ->
-                    pool.with(server) { conn ->
-                        val items = conn.list(root.path)
-                        Log.i(TAG, "连接成功：${server.display}/${server.share} 根「${root.path}」${items.size} 项")
+                // 每个媒体库根目录都要实际列一次：某个根填错了当场暴露，不留到扫描时才发现
+                StorageProtocol.SMB -> {
+                    server.roots.forEach { root ->
+                        pool.with(server) { conn ->
+                            val items = conn.list(root.path)
+                            Log.i(TAG, "连接成功：${server.display}/${server.share} 根「${root.path}」${items.size} 项")
+                        }
                     }
+                    server
                 }
-                StorageProtocol.WEBDAV -> WebDavStorage(server).use { dav ->
+
+                StorageProtocol.WEBDAV -> {
                     try {
-                        server.roots.forEach { root ->
-                            val items = dav.list(root.path)
-                            Log.i(TAG, "连接成功：${server.baseUrl} 根「${root.path}」${items.size} 项")
-                        }
+                        listDavRoots(server)
+                        server
                     } catch (e: DavException) {
-                        // 404 时补一段「到底哪一层错了」的诊断，别让用户对着同一个报错反复改
-                        if (e.notFound) {
-                            throw DavException((e.message.orEmpty() + server.davNotFoundHint()), e)
+                        if (!e.notFound) throw e
+                        // 从 SMB 切过来最常见的坑：SMB 不区分大小写，WebDAV 区分
+                        val fixed = server.davRepairCase()
+                        if (fixed == null) {
+                            throw DavException(e.message.orEmpty() + server.davNotFoundHint(), e)
                         }
-                        throw e
+                        // 修完必须整根再验一遍：只是「某一段碰巧能列」不算通
+                        try {
+                            listDavRoots(fixed)
+                        } catch (again: DavException) {
+                            if (!again.notFound) throw again
+                            throw DavException(
+                                again.message.orEmpty() + fixed.davNotFoundHint(),
+                                again,
+                            )
+                        }
+                        Log.i(TAG, "已按服务器实际写法修正路径：${server.basePath} → ${fixed.basePath}")
+                        fixed
                     }
                 }
             }
-            Unit
+        }
+    }
+
+    private fun listDavRoots(server: SmbServer) = WebDavStorage(server).use { dav ->
+        server.roots.forEach { root ->
+            val items = dav.list(root.path)
+            Log.i(TAG, "连接成功：${server.baseUrl} 根「${root.path}」${items.size} 项")
         }
     }
 

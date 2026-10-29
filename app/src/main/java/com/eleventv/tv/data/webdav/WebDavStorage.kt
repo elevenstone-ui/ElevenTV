@@ -34,6 +34,67 @@ fun SmbServer.davRequestHeaders(): Map<String, String> =
     davAuthHeader()?.let { mapOf("Authorization" to it) } ?: emptyMap()
 
 /**
+ * 把「大小写写错的路径」修成服务器上真实存在的写法，修不出来返回 null。
+ *
+ * ## 为什么值得专门做一层
+ *
+ * WebDAV 的路径**区分大小写**，SMB **不区分**。用户在 Windows 上敲惯了
+ * `\\nas\multimedia`，切到 WebDAV 时路径前缀自然还是小写，然后收到一个 404——
+ * 和「这个共享根本不存在」一模一样的报错。而 SMB 那边一切正常，所以几乎没人
+ * 会想到是大小写。这一层就是把「猜」变成「试」：原样不通就换大小写变体各试一次，
+ * 哪个能列出目录就是它。
+ *
+ * 只修首段（共享名）与起始目录首段的**写法**，不改层级、不做模糊匹配；
+ * 修完必须由调用方再用完整根目录列表验证一遍。
+ */
+fun SmbServer.davRepairCase(): SmbServer? {
+    val base = basePath.trim('/')
+    if (base.isBlank()) return null
+    val first = base.substringBefore('/')
+    if (first.isBlank()) return null
+
+    val actual = probeShareCase(first) ?: return null
+    var fixed = if (actual == first) this else copy(basePath = base.replaceFirst(first, actual))
+
+    // 共享名通了，再看「起始目录」：列出真实子目录名，逐段纠正大小写
+    val names = runCatching { WebDavStorage(fixed).use { it.list("") } }
+        .getOrNull()
+        ?.filter { it.isDirectory }
+        ?.map { it.name }
+        ?: return null
+
+    val fixedRoots = roots.map { root ->
+        val segs = root.path.split('/').filter { it.isNotBlank() }
+        if (segs.isEmpty()) return@map root
+        // 完全一致优先，其次是忽略大小写后唯一匹配的那个
+        val real = names.firstOrNull { it == segs[0] }
+            ?: names.firstOrNull { it.equals(segs[0], ignoreCase = true) }
+            ?: return@map root
+        if (real == segs[0]) root else root.copy(path = (listOf(real) + segs.drop(1)).joinToString("/"))
+    }
+    if (fixedRoots != roots) fixed = fixed.copy(mediaRoots = fixedRoots)
+
+    return if (fixed == this) null else fixed
+}
+
+/** 依次试 `Media` / `media` / `MEDIA` 这类写法，返回第一个能列出目录的 */
+private fun SmbServer.probeShareCase(wanted: String): String? {
+    val candidates = listOf(
+        wanted,
+        wanted.lowercase(),
+        wanted.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.lowercase() },
+        wanted.uppercase(),
+    ).distinct()
+    for (candidate in candidates) {
+        val reachable = runCatching {
+            WebDavStorage(copy(basePath = candidate)).use { it.list("") }
+        }.isSuccess
+        if (reachable) return candidate
+    }
+    return null
+}
+
+/**
  * 404 的自诊断：把「到底哪一层错了」写进错误信息。
  *
  * 404 有四种完全不同的成因，只给一句「路径不存在」，用户只能反复改、反复试：

@@ -71,7 +71,7 @@ fun SettingsScreen(
     scrapeJob: JobState,
     entryCount: Int,
     scrapedCount: Int,
-    onTest: suspend (SmbServer) -> Result<Unit>,
+    onTest: suspend (SmbServer) -> Result<SmbServer>,
     onSaveServer: (SmbServer) -> Unit,
     onDeleteServer: (String) -> Unit,
     onScan: () -> Unit,
@@ -398,9 +398,14 @@ fun SettingsScreen(
         ServerEditorDialog(
             initial = editor,
             onTest = onTest,
-            onSave = { server ->
+            onSave = { server, correction ->
                 onSaveServer(server)
                 editorOpen = false
+                // 自动改过就必须说一声：不然用户下次手填时还以为自己是照原样填对的
+                if (correction != null) {
+                    message = "已自动修正为服务器上的实际写法" to
+                        "$correction\n\nWebDAV 路径区分大小写，SMB 不区分，从 SMB 切过来时最容易踩这一条。"
+                }
             },
             onDismiss = { editorOpen = false },
         )
@@ -607,8 +612,9 @@ private fun KeyRow(label: String, value: String, onEdit: () -> Unit) {
 @Composable
 private fun ServerEditorDialog(
     initial: SmbServer?,
-    onTest: suspend (SmbServer) -> Result<Unit>,
-    onSave: (SmbServer) -> Unit,
+    onTest: suspend (SmbServer) -> Result<SmbServer>,
+    /** [correction] 非 null 表示测试时自动改了配置（WebDAV 路径大小写），界面要告知用户 */
+    onSave: (SmbServer, String?) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -675,12 +681,15 @@ private fun ServerEditorDialog(
                         testing = true
                         error = null
                         scope.launch {
-                            val r = onTest(build())
+                            val draft = build()
+                            val r = onTest(draft)
                             testing = false
                             error = r.exceptionOrNull()?.message
-                            if (r.isSuccess) {
+                            // 保存的是**测通的那份**，不是手里这份草稿：WebDAV 会在 404 时
+                            // 自动把路径大小写改成服务器实际写法，存草稿等于白测。
+                            r.onSuccess { ok ->
                                 // 测通即存：TV 上再点一次「保存」是多余的一步
-                                onSave(build())
+                                onSave(ok, correctionNote(draft, ok))
                             }
                         }
                     },
@@ -691,7 +700,7 @@ private fun ServerEditorDialog(
                     loading = testing,
                 )
                 TvButton(
-                    onClick = { onSave(build()) },
+                    onClick = { onSave(build(), null) },
                     label = "直接保存",
                     variant = TvButtonVariant.Ghost,
                     enabled = valid,
@@ -768,4 +777,25 @@ private fun ServerEditorDialog(
             TvText(it, style = T.Caption, color = C.Error, maxLines = 6)
         }
     }
+}
+
+/**
+ * 把「测试时自动改了什么」变成一句人话。
+ *
+ * 静默改配置是危险的：用户下次在别处手填，仍会按自己原来那份写，然后再次踩坑。
+ * 所以改了就说，说清楚从什么改成什么。
+ */
+private fun correctionNote(draft: SmbServer, tested: SmbServer): String? {
+    val parts = buildList {
+        if (tested.basePath != draft.basePath) {
+            add("路径前缀「${draft.basePath.ifBlank { "空" }}」→「${tested.basePath}」")
+        }
+        if (tested.roots != draft.roots) {
+            add(
+                "起始目录「${draft.roots.joinToString("、") { it.path }}」→" +
+                    "「${tested.roots.joinToString("、") { it.path }}」",
+            )
+        }
+    }
+    return parts.takeIf { it.isNotEmpty() }?.joinToString("；")
 }

@@ -41,7 +41,7 @@ interface ElevenRepository {
 
     // ---- 服务器 ----
 
-    suspend fun testServer(server: SmbServer): Result<Unit>
+    suspend fun testServer(server: SmbServer): Result<SmbServer>
 
     /** 浏览目录，用于添加服务器时选择根路径 */
     suspend fun browse(server: SmbServer, path: String): Result<List<SmbEntry>>
