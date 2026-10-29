@@ -102,23 +102,30 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
                 }
             }
 
+            // 报错必须带上真实请求的 URL：用户拿这一行直接粘到电脑浏览器里，
+            // 就能把「App 参数错」和「NAS 没开 WebDAV / 端口不对」区分开，
+            // 否则只能在电视上反复试，一次一条猜测。
+            val where = "；请求 $url"
             when (code) {
                 in 200..299 -> Unit
                 401 -> throw DavException(
                     "WebDAV 认证失败（401）：检查用户名与密码" +
-                        if (server.username.isBlank()) "——当前未填写用户名" else "",
+                        (if (server.username.isBlank()) "——当前未填写用户名" else "") + where,
                 )
-                403 -> throw DavException("WebDAV 无权限（403）：该账号不能访问 ${server.basePath.ifBlank { "/" }}")
-                404 -> throw DavException("WebDAV 路径不存在（404）：检查${PATH_HINT}", notFound = true)
+                403 -> throw DavException(
+                    "WebDAV 无权限（403）：该账号不能访问 ${server.basePath.ifBlank { "/" }}。"
+                        + "威联通要在「控制台 → 权限设定 → 共享文件夹」给该共享开 WebDAV 权限" + where,
+                )
+                404 -> throw DavException("WebDAV 路径不存在（404）：检查${PATH_HINT}$where", notFound = true)
                 405 -> throw DavException(
-                    "该地址不支持 WebDAV（405）：端口可能填成了管理后台或 SMB 端口" +
-                        "——WebDAV 默认端口 5005（HTTP）/ 5006（HTTPS），" +
-                        "威联通需先在「控制台 → 应用服务 → WebDAV」启用",
+                    "该地址不支持 WebDAV（405）：端口很可能填成了管理后台。"
+                        + "威联通在「控制台 → 网络和文件服务 → Win/Mac/NFS/WebDAV」勾选「启用 WebDAV」，"
+                        + "端口以那个页面显示的为准（常见 5005/5006，可自定义）" + where,
                 )
-                409 -> throw DavException("WebDAV 冲突（409）：路径不是目录")
-                423 -> throw DavException("WebDAV 资源被锁定（423）")
-                500, 502, 503, 504 -> throw DavException("WebDAV 服务暂不可用（HTTP $code）", retryable = true)
-                else -> throw DavException("WebDAV 请求失败（HTTP $code）")
+                409 -> throw DavException("WebDAV 冲突（409）：路径不是目录" + where)
+                423 -> throw DavException("WebDAV 资源被锁定（423）" + where)
+                500, 502, 503, 504 -> throw DavException("WebDAV 服务暂不可用（HTTP $code）$where", retryable = true)
+                else -> throw DavException("WebDAV 请求失败（HTTP $code）$where")
             }
 
             return conn.inputStream.use { parse(it, url) }
@@ -130,9 +137,17 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
                 e,
             )
         } catch (e: java.net.SocketTimeoutException) {
-            throw DavException("WebDAV 连接超时（${CONNECT_TIMEOUT_MS / 1000} 秒）：检查地址与端口", e, retryable = true)
+            throw DavException(
+                "WebDAV 连接超时（${CONNECT_TIMEOUT_MS / 1000} 秒）：地址或端口不通；请求 ${server.baseUrl}",
+                e,
+                retryable = true,
+            )
         } catch (e: java.net.ConnectException) {
-            throw DavException("连不上 ${server.host}:${server.port}：检查 NAS 是否在线、端口是否放行", e, retryable = true)
+            throw DavException(
+                "连不上 ${server.host}:${server.port}：检查 NAS 是否在线、该端口是否有服务在监听（或被防火墙拦了）",
+                e,
+                retryable = true,
+            )
         } finally {
             runCatching { conn.disconnect() }
         }

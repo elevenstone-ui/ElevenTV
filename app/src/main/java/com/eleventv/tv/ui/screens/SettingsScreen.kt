@@ -757,7 +757,8 @@ private fun ServerEditorDialog(
 
         error?.let {
             VSpace(D.Lg)
-            TvText(it, style = T.Caption, color = C.Error, maxLines = 2)
+            // 4 行：WebDAV 的报错带「请求 URL」，两行会被截断，而截掉的正好是能拿去浏览器验证的那串
+            TvText(it, style = T.Caption, color = C.Error, maxLines = 4)
         }
     }
 }
