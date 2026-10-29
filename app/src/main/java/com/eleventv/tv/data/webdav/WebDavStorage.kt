@@ -8,9 +8,7 @@ import com.eleventv.tv.data.storage.RemoteEntry
 import com.eleventv.tv.data.storage.RemoteStorage
 import org.xmlpull.v1.XmlPullParser
 import java.io.IOException
-import java.net.HttpURLConnection
 import java.net.URI
-import java.net.URL
 import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -76,59 +74,16 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
 
     private fun request(url: String, depth: Int, hop: Int = 0): List<RemoteEntry> {
         val body = PROPFIND_BODY.toByteArray(Charsets.UTF_8)
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "PROPFIND"
-            connectTimeout = CONNECT_TIMEOUT_MS
-            readTimeout = READ_TIMEOUT_MS
-            instanceFollowRedirects = false
-            setFixedLengthStreamingMode(body.size)
-            doOutput = true
-            setRequestProperty("Depth", depth.toString())
-            setRequestProperty("Content-Type", "application/xml; charset=utf-8")
-            setRequestProperty("Accept", "application/xml")
-            server.davAuthHeader()?.let { setRequestProperty("Authorization", it) }
+        val headers = buildMap {
+            put("Depth", depth.toString())
+            put("Content-Type", "application/xml; charset=utf-8")
+            put("Accept", "application/xml")
+            put("User-Agent", USER_AGENT)
+            server.davAuthHeader()?.let { put("Authorization", it) }
         }
 
-        try {
-            conn.outputStream.use { it.write(body) }
-            val code = conn.responseCode
-
-            // PROPFIND 不是 GET，Java 的自动跳转不会生效；补 `/` 或 http→https 的跳转得自己跟
-            if (code in REDIRECTS && hop < 2) {
-                val location = conn.getHeaderField("Location")
-                if (!location.isNullOrBlank()) {
-                    val next = runCatching { URI(url).resolve(location).toString() }.getOrNull()
-                    if (!next.isNullOrBlank()) return request(next, depth, hop + 1)
-                }
-            }
-
-            // 报错必须带上真实请求的 URL：用户拿这一行直接粘到电脑浏览器里，
-            // 就能把「App 参数错」和「NAS 没开 WebDAV / 端口不对」区分开，
-            // 否则只能在电视上反复试，一次一条猜测。
-            val where = "；请求 $url"
-            when (code) {
-                in 200..299 -> Unit
-                401 -> throw DavException(
-                    "WebDAV 认证失败（401）：检查用户名与密码" +
-                        (if (server.username.isBlank()) "——当前未填写用户名" else "") + where,
-                )
-                403 -> throw DavException(
-                    "WebDAV 无权限（403）：该账号不能访问 ${server.basePath.ifBlank { "/" }}。"
-                        + "威联通要在「控制台 → 权限设定 → 共享文件夹」给该共享开 WebDAV 权限" + where,
-                )
-                404 -> throw DavException("WebDAV 路径不存在（404）：检查${PATH_HINT}$where", notFound = true)
-                405 -> throw DavException(
-                    "该地址不支持 WebDAV（405）：端口很可能填成了管理后台。"
-                        + "威联通在「控制台 → 网络和文件服务 → Win/Mac/NFS/WebDAV」勾选「启用 WebDAV」，"
-                        + "端口以那个页面显示的为准（常见 5005/5006，可自定义）" + where,
-                )
-                409 -> throw DavException("WebDAV 冲突（409）：路径不是目录" + where)
-                423 -> throw DavException("WebDAV 资源被锁定（423）" + where)
-                500, 502, 503, 504 -> throw DavException("WebDAV 服务暂不可用（HTTP $code）$where", retryable = true)
-                else -> throw DavException("WebDAV 请求失败（HTTP $code）$where")
-            }
-
-            return conn.inputStream.use { parse(it, url) }
+        val response = try {
+            DavHttp.exchange(url, "PROPFIND", body, headers, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS)
         } catch (e: DavException) {
             throw e
         } catch (e: javax.net.ssl.SSLHandshakeException) {
@@ -138,7 +93,7 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
             )
         } catch (e: java.net.SocketTimeoutException) {
             throw DavException(
-                "WebDAV 连接超时（${CONNECT_TIMEOUT_MS / 1000} 秒）：地址或端口不通；请求 ${server.baseUrl}",
+                "WebDAV 连接超时（${READ_TIMEOUT_MS / 1000} 秒无响应）：地址或端口不通；请求 $url",
                 e,
                 retryable = true,
             )
@@ -148,9 +103,80 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
                 e,
                 retryable = true,
             )
-        } finally {
-            runCatching { conn.disconnect() }
+        } catch (e: java.net.UnknownHostException) {
+            throw DavException("域名解析失败（${server.host}）：局域网里直接填 IP 更稳", e)
+        } catch (e: IOException) {
+            // 服务器把连接掐了、或者返回了半截响应。局域网抖动居多，值得重试一次
+            throw DavException("WebDAV 连接中断：${e.message ?: "连接被关闭"}；请求 $url", e, retryable = true)
         }
+
+        // PROPFIND 不是 GET，Java 的自动跳转不会生效；补 `/` 或 http→https 的跳转得自己跟
+        if (response.code in REDIRECTS && hop < 2) {
+            val location = response.headers["location"]
+            if (!location.isNullOrBlank()) {
+                val next = runCatching { URI(url).resolve(location).toString() }.getOrNull()
+                if (!next.isNullOrBlank()) return request(next, depth, hop + 1)
+            }
+        }
+
+        // 报错必须带上真实请求的 URL：用户拿这一行直接粘到电脑浏览器里，
+        // 就能把「App 参数错」和「NAS 没开 WebDAV / 端口不对」区分开，
+        // 否则只能在电视上反复试，一次一条猜测。
+        val where = "；请求 $url"
+        when (response.code) {
+            in 200..299 -> Unit
+            401 -> throw DavException(
+                "WebDAV 认证失败（401）：检查用户名与密码" +
+                    (if (server.username.isBlank()) "——当前未填写用户名" else "") + where,
+            )
+            403 -> throw DavException(
+                if (server.basePath.isBlank()) {
+                    // 浏览器打开 `http://NAS:5005/` 看到 Forbidden 就是这个：服务是通的，
+                    // 只是 NAS 一律不允许列出根目录。它不代表账号没权限。
+                    val hint = "WebDAV 拒绝列出根目录（403）：「路径前缀」必须填共享名（如 media），" +
+                        "留空会去列 NAS 根，任何账号都会被拒"
+                    hint + where
+                } else {
+                    val hint = "WebDAV 无权限（403）：该账号不能访问 ${server.basePath}。" +
+                        "威联通要在「控制台 → 权限设定 → 共享文件夹」给该共享开 WebDAV 权限"
+                    hint + where
+                },
+            )
+            404 -> throw DavException("WebDAV 路径不存在（404）：检查${PATH_HINT}$where", notFound = true)
+            405 -> throw DavException(
+                "该地址不支持 WebDAV（405）：端口很可能填成了管理后台。"
+                    + "威联通在「控制台 → 网络和文件服务 → Win/Mac/NFS/WebDAV」勾选「启用 WebDAV」，"
+                    + "端口以那个页面显示的为准（常见 5005/5006，可自定义）" + where,
+            )
+            409 -> throw DavException("WebDAV 冲突（409）：路径不是目录" + where)
+            423 -> throw DavException("WebDAV 资源被锁定（423）" + where)
+            500, 502, 503, 504 -> throw DavException("WebDAV 服务暂不可用（HTTP ${response.code}）$where", retryable = true)
+            else -> {
+                val desc = statusText(response.code)
+                throw DavException(
+                    "WebDAV 请求失败（HTTP ${response.code}${if (desc.isEmpty()) "" else " $desc"}）$where",
+                )
+            }
+        }
+
+        return parse(java.io.ByteArrayInputStream(response.body), url)
+    }
+
+    /** 只给报错文案用的粗粒度状态描述，避免用户对着一个裸数字查文档 */
+    private fun statusText(code: Int): String = when (code) {
+        400 -> "请求有误"
+        405 -> "方法不被允许"
+        406 -> "服务端无法满足 Accept"
+        408 -> "服务端读超时"
+        413 -> "请求体过大"
+        414 -> "URL 过长"
+        422 -> "无法处理"
+        429 -> "请求过于频繁"
+        501 -> "服务端不支持 PROPFIND"
+        507 -> "存储空间不足"
+        in 300..399 -> "重定向"
+        in 500..599 -> "服务端错误"
+        else -> ""
     }
 
     // ---------------- XML ----------------
@@ -263,6 +289,7 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
         const val TAG = "ElevenTV"
         const val CONNECT_TIMEOUT_MS = 10_000
         const val READ_TIMEOUT_MS = 30_000
+        const val USER_AGENT = "ElevenTV/2.1 (Android TV)"
         const val PATH_HINT = " 路径前缀（basePath）是否与 NAS 上的共享目录一致"
         val REDIRECTS = setOf(301, 302, 303, 307, 308)
 

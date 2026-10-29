@@ -642,7 +642,13 @@ private fun ServerEditorDialog(
         username = user.trim(),
         password = pass,
         protocol = protocol,
-        basePath = if (protocol == StorageProtocol.WEBDAV) basePath.trim().trim('/') else "",
+        // 留空时用共享名兜底：NAS 一律不允许列根目录，留空的必然结果是 403。
+        // 顺带保住 id 稳定（id 里带 share），切协议不会让整库记录失配。
+        basePath = if (protocol == StorageProtocol.WEBDAV) {
+            basePath.trim().ifBlank { share.trim() }.trim('/')
+        } else {
+            ""
+        },
         mediaRoots = root.split('、')
             .map { it.trim().trim('/') }
             .filter { it.isNotBlank() }
@@ -732,8 +738,8 @@ private fun ServerEditorDialog(
             TvTextField(
                 value = basePath,
                 onValueChange = { basePath = it },
-                label = "路径前缀（可留空）",
-                placeholder = "留空 = 服务器根，如 media",
+                label = "路径前缀（填共享名）",
+                placeholder = "如 media；留空会去列 NAS 根，必然 403",
             )
         }
         VSpace(D.Lg)

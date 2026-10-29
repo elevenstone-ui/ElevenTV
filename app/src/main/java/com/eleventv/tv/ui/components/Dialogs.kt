@@ -9,7 +9,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
@@ -65,7 +67,20 @@ fun TvDialog(
         ) {
             TvText(title, style = T.Title1, color = C.Text1)
             VSpace(D.Xl)
-            content()
+            // 内容区必须可滚动，否则字段一多就顶出屏幕。
+            //
+            // 之前「服务器编辑」弹窗就是这么坏掉的：协议/地址/端口/路径前缀被挤到屏幕上方
+            // 之外（截图上直接从「用户名」开始），焦点却还会往那些看不见的控件上走——
+            // 用户的感觉是「焦点跑到不知道哪里去了、下面的按钮选不到」。
+            // weight(1f) + verticalScroll：可用高度 = 弹窗高度减去标题与操作区，
+            // 超出部分滚动；Compose 在焦点移动时会自动把目标滚进可视区。
+            Column(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                content()
+            }
             if (actions != null) {
                 VSpace(D.X2l)
                 Row(

@@ -922,8 +922,31 @@ class PlayerState(
             PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
             -> "连不上 NAS，检查网络与服务器状态"
 
-            else -> e.message ?: "播放失败"
+            // Media3 的 PlaybackException.message 只有一句「Source error」，
+            // 真正的原因在 cause 链上（HttpDataSource 的 401/404、SMB 的传输异常）。
+            // 直接把最深一层的 message 显示出来，否则用户只能看到一个等于没说的词。
+            else -> rootMessage(e) ?: "播放失败"
         }
+    }
+
+    /**
+     * 取异常链上最有信息量的那条 message。
+     *
+     * 从外往里走，跳过 Media3 自己的占位文案（`Source error`、`Unexpected error`），
+     * 保留最内层的真实原因，例如 `HttpDataSourceException: 401` 或
+     * `SmbException: STATUS_NETWORK_NAME_DELETED`。
+     */
+    private fun rootMessage(e: Throwable): String? {
+        var t: Throwable? = e
+        var best: String? = null
+        var depth = 0
+        while (t != null && depth < 8) {
+            val m = t.message?.trim()
+            if (!m.isNullOrEmpty() && m != "Source error" && m != "Unexpected error") best = m
+            t = t.cause
+            depth++
+        }
+        return best
     }
 
     private companion object {

@@ -22,9 +22,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -60,6 +67,7 @@ fun TvTextField(
 ) {
     var focused by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
     val shape = RoundedCornerShape(D.RadiusField)
 
     Column(modifier = modifier) {
@@ -78,6 +86,25 @@ fun TvTextField(
                 // 焦点由内部的 BasicTextField 持有，这里只负责画框：
                 // 父节点的 onFocusChanged 会收到子节点获得焦点的事件
                 .focusBorder(focused, shape)
+                // 方向键上下必须由这里「截」下来交给焦点系统。
+                //
+                // BasicTextField 自己处理方向键（移动光标），单行输入框里按「下」既不移动光标
+                // 也不会把事件还回去——焦点被永久锁在输入框里，下面的按钮永远选不到。
+                // 这是 TV 端 Compose 输入框的经典坑，弹窗里表现得最明显：
+                // 用户填完「显示名称」就再也下不去了。
+                // 用 onPreviewKeyEvent 才能抢在 BasicTextField 之前拿到事件；
+                // 左右键保持默认（编辑时需要移动光标）。
+                .onPreviewKeyEvent { e ->
+                    if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    val direction = when (e.key) {
+                        Key.DirectionDown -> FocusDirection.Down
+                        Key.DirectionUp -> FocusDirection.Up
+                        else -> return@onPreviewKeyEvent false
+                    }
+                    val moved = focusManager.moveFocus(direction)
+                    if (moved) keyboard?.hide()
+                    moved
+                }
                 .onFocusChanged {
                     // 必须用 hasFocus 而不是 isFocused：这个 Box 自身没有焦点目标，
                     // 子节点（BasicTextField）拿到焦点时它只会变成 hasFocus。
