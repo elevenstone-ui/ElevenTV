@@ -20,6 +20,18 @@ val tmdbApiKey: String = localProps.getProperty("tmdb.apiKey").orEmpty()
 val tmdbReadToken: String = localProps.getProperty("tmdb.readToken").orEmpty()
 val fanartApiKey: String = localProps.getProperty("fanart.apiKey").orEmpty()
 
+// 自用发布签名：keystore.properties 与 keystore/*.jks 都在 .gitignore 里，
+// 换台机器 clone 下来照样能 build，只是产物未签名（别人拿到了也装不出「同一个 App」，
+// 后续升级会因签名不同而互相覆盖失败）。
+// 缺签名材料时不让整个构建挂掉——只在 assembleRelease 时给出未签名包。
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val releaseStoreFile: File? = keystoreProps.getProperty("storeFile")
+    ?.let { rootProject.file(it) }
+    ?.takeIf { it.exists() }
+
 // 构建时间戳写进 BuildConfig：两个功能差别很大的包若共用同一个 versionName，
 // 电视上根本分不清装的是哪个（2.0.2 / versionCode 3 曾经同时对应 SMB 版和 WebDAV 版）。
 // 关于页显示它，用户报问题时一句话就能定位到具体产物。
@@ -36,8 +48,8 @@ android {
         // A9F 出厂 Android 8.0（API 26）；26 起自适应图标可用
         minSdk = 26
         targetSdk = 36
-        versionCode = 10
-        versionName = "2.1.6-webdav"
+        versionCode = 11
+        versionName = "2.1.7-webdav"
 
         buildConfigField("String", "TMDB_API_KEY", "\"$tmdbApiKey\"")
         buildConfigField("String", "TMDB_READ_TOKEN", "\"$tmdbReadToken\"")
@@ -45,8 +57,29 @@ android {
         buildConfigField("String", "BUILD_STAMP", "\"$buildStamp\"")
     }
 
+    signingConfigs {
+        if (releaseStoreFile != null) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+                // 自用：不启用 v1 之外的花活也不必要，默认 v2/v3 已由 AGP 打开。
+                enableV1Signing = true
+                enableV2Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
+            // 修 bug 后覆盖安装时必须沿用同一把 key，否则系统以「签名不一致」拒绝升级。
+            // 没有 keystore.properties 时不挂签名，产物为 app-release-unsigned.apk。
+            signingConfig = if (releaseStoreFile != null) {
+                signingConfigs.getByName("release")
+            } else {
+                null
+            }
             // 开混淆 + 资源压缩：APK 里能看到类名就等于把内部结构（尤其是刮削流程与
             // 凭证读取路径）直接摊开给人看，配合「源码里不再内置 Key」才谈得上安全。
             // 规则见 proguard-rules.pro（serialization 的 serializer、smbj 的反射）。

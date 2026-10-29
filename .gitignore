@@ -3,6 +3,8 @@
 .kotlin/
 local.properties
 keystore.properties
+# 自用发布签名：私钥丢了就没法再覆盖升级（只能卸载重装），也绝不能进版本库
+keystore/
 *.jks
 *.keystore
 .idea/
