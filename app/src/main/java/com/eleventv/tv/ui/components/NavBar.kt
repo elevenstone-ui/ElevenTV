@@ -49,7 +49,8 @@ val DefaultNavItems = listOf(
 /**
  * 顶部导航栏（高 64dp，左右 48dp）。
  *
- * 左端是品牌标志（矢量 16dp），其后是菜单项。
+ * 左端是品牌标志（矢量 32dp + 21.3sp 字标，比例 3:2），其后是菜单项。
+ * 标志放大后菜单由 Row 自动右推，两者边缘间距不变（[D.X2l] + 内层 [D.Lg]）。
  *
  * ## 焦点视觉为什么和全应用不一样
  *
@@ -78,6 +79,10 @@ fun TvNavBar(
             .height(D.NavHeight)
             .padding(horizontal = D.ScreenPaddingX),
     ) {
+        // 字标字号（32dp → 21.3sp）与间距（32dp → 8dp）由 BrandLogo 按图形推出，
+        // 这里不再传。间距不从 0.25H 脱钩：手调成 12dp 之后，下次改标志尺寸，
+        // 间距就成了没人管的孤儿值。菜单也不必手动位移：
+        // 这一行是 Row，品牌块变宽后菜单自然被推到右边，边缘间距保持不变。
         BrandLogo(showWordmark = true, markSize = D.LogoMark)
 
         Row(

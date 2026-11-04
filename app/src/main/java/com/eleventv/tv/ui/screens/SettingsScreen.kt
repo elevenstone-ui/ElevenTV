@@ -37,6 +37,7 @@ import com.eleventv.tv.data.model.MediaRoot
 import com.eleventv.tv.data.model.SmbServer
 import com.eleventv.tv.data.model.StorageProtocol
 import com.eleventv.tv.ui.components.BrandLogo
+import com.eleventv.tv.ui.components.BrandWordmark
 import com.eleventv.tv.ui.components.ChoiceRow
 import com.eleventv.tv.ui.components.ConfirmDialog
 import com.eleventv.tv.ui.components.InfoRow
@@ -311,6 +312,12 @@ fun SettingsScreen(
                         checked = settings.autoNextEpisode,
                         onToggle = { onUpdateSettings { s -> s.copy(autoNextEpisode = !s.autoNextEpisode) } },
                     )
+                    ToggleRow(
+                        label = "启动音效",
+                        description = "与启动动画配套的短音效，关闭后启动页静默",
+                        checked = settings.splashSound,
+                        onToggle = { onUpdateSettings { s -> s.copy(splashSound = !s.splashSound) } },
+                    )
                     ChoiceRow(
                         // 原来的上限 1.5×（约 25sp）在三米外仍然偏小，用户反馈「特大不够大」。
                         // 上限放到 2.6×（约 44sp，1080p 下约占画面高度 8%），并补「超大/巨大」
@@ -386,13 +393,15 @@ fun SettingsScreen(
             // ---------------- 关于 ----------------
             item("about") {
                 SettingsCard(title = "关于") {
+                    // 标志与字标同样是 3:2 的组合：28dp 标志 → 18.7sp 字标、7dp 间距。
+                    // 间距不能用 D.Xl：它是内容间距，不是图形与字标的关系值。
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(D.Xl),
+                        horizontalArrangement = Arrangement.spacedBy(D.lockGap(D.LogoMarkAbout)),
                     ) {
                         BrandLogo(showWordmark = false, markSize = D.LogoMarkAbout)
                         Column {
-                            TvText("ElevenTV", style = T.Title1, color = C.Text1)
+                            BrandWordmark(D.LogoMarkAbout)
                             TvText(
                                 text = "版本 ${BuildConfig.VERSION_NAME} · 构建 ${BuildConfig.BUILD_STAMP}",
                                 style = T.Caption,

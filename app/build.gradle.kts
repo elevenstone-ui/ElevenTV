@@ -48,8 +48,8 @@ android {
         // A9F 出厂 Android 8.0（API 26）；26 起自适应图标可用
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "2.1.7-webdav"
+        versionCode = 16
+        versionName = "2.1.12-webdav"
 
         buildConfigField("String", "TMDB_API_KEY", "\"$tmdbApiKey\"")
         buildConfigField("String", "TMDB_READ_TOKEN", "\"$tmdbReadToken\"")
@@ -72,6 +72,12 @@ android {
     }
 
     buildTypes {
+        // debug 与 release 的 versionCode 必然相同（都由 defaultConfig 决定），
+        // 但两者签名不同、无法互相覆盖。给 debug 加后缀，关于页才分得清
+        // 「装的是调试包还是正式包」——同号不同包正是上次装错包的根源。
+        debug {
+            versionNameSuffix = "-debug"
+        }
         release {
             // 修 bug 后覆盖安装时必须沿用同一把 key，否则系统以「签名不一致」拒绝升级。
             // 没有 keystore.properties 时不挂签名，产物为 app-release-unsigned.apk。

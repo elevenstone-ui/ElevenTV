@@ -717,8 +717,14 @@ class LocalRepository(
                 if (version <= written.get()) return
                 // 写失败必须留痕：磁盘满 / 权限异常时以前是完全静默的，
                 // 用户只会看到「重启后数据回到昨天」。
-                runCatching { block() }.exceptionOrNull()?.let {
-                    Log.w(TAG, "落盘失败（版本 $version）", it)
+                val failed = runCatching { block() }.exceptionOrNull()
+                if (failed != null) {
+                    Log.w(TAG, "落盘失败（版本 $version）", failed)
+                    // 关键：失败**不**推进 written。否则版本号向前跳了一格，
+                    // 下一次「更旧」的快照进来会被 `version <= written` 误判为过期而丢弃，
+                    // 但磁盘上其实没有这份内容——UI 以为保存成功，重启后数据回退。
+                    // 留旧版本号，后续任意一次成功写盘都能把最新内容落下去。
+                    return
                 }
                 written.set(version)
             }

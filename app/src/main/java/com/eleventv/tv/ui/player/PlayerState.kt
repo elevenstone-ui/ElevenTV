@@ -265,6 +265,9 @@ class PlayerState(
         // 回写设置：不回写的话退出播放器再进来又回到旧值
         onDecoderChosen(target)
         val wasPlaying = player.isPlaying
+        // 先摘 ticker 再释放旧 player，避免释放期间的同步回调把旧状态写入新播放器；
+        // ticker 在 start() 里会重新 post
+        handler.removeCallbacks(ticker)
         runCatching { player.release() }
         player = buildPlayer()
         playerToken++
@@ -740,6 +743,10 @@ class PlayerState(
         player.prepare()
         if (startMs > 0L) player.seekTo(startMs)
         player.playWhenReady = autoPlay
+        // 起播/换集/重试都必须让进度同步循环活着：ticker 在「停止自动连播的 ENDED」
+        // 与 switchDecoder 里被摘除过，这里重新挂上，保证 5s 落盘 + 缓冲超时提示始终可用
+        handler.removeCallbacks(ticker)
+        handler.post(ticker)
     }
 
     private fun resumePositionOf(target: MediaFile): Long {
@@ -864,6 +871,8 @@ class PlayerState(
                 osd = OsdMode.Main
                 selected = 0
                 armAutoHide()
+                // 不再自动连播：ticker 停止空转，避免 500ms 一次的无效 postDelayed 循环
+                handler.removeCallbacks(ticker)
             }
         }
     }

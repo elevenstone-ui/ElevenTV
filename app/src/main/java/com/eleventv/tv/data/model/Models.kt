@@ -485,6 +485,12 @@ data class AppSettings(
     val subtitleBgAlpha: Float = 0.6f,
     /** 自动下一集 */
     val autoNextEpisode: Boolean = true,
+    /**
+     * 启动音效。冷启动时播放一条与启动动画对齐的提示音
+     *（逐字母「叮」+ 落位音），与 [M.SPLASH_ANIM] 同步。
+     * 默认开；关掉后不再打扰。老设置向后兼容（旧 json 没此字段时走默认值 true）。
+     */
+    val splashSound: Boolean = true,
 )
 
 @Serializable

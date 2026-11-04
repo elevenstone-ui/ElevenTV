@@ -8,6 +8,8 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineHeightStyle
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
@@ -139,26 +141,45 @@ object D {
     val FocusRing = 2.dp
     val FocusGlow = 2.5.dp
 
-    /** 导航栏标志 16dp（与 T.Nav 14→16sp 的放大同步调整，原 10.5dp 偏小），走矢量 */
-    val LogoMark = 16.dp
+    /**
+     * 导航栏标志 32dp。
+     *
+     * 字标字号不在这里定，由 [T.brandWordmark] 按 [LockRatio] 推出（32dp → 21.3sp）。
+     * 标志与字标必须成对改，否则左上角会变成「一个大图标 + 一行小字」。
+     */
+    val LogoMark = 32.dp
     val LogoMarkLarge = 40.dp
     val LogoMarkAbout = 28.dp
 
     /** 启动页标志：三米外一眼能认出，又不至于顶到画面边缘 */
     val LogoMarkSplash = 96.dp
 
+    /**
+     * 品牌组合法则（与设计稿 `ElevenTV-UI.html` 的 `--lock-ratio` / `--lock-gap` 同源）。
+     *
+     *     · 字标字号 = 图形高度 ÷ [LockRatio]   → 图形 H : 字号 = 3 : 2
+     *     · 间距     = 图形高度 × [LockGapRatio]
+     *
+     * 图形是带圆角的实心块，同高度下视觉重量远大于字母：
+     * 比例小于 1.4 时字标压图形（旧封面 1.27），大于 1.6 时字标沦为图形的注脚
+     * （旧规范面板 1.68 / 旧横幅 1.69 / 旧 App 1.33 与 1.62 各说各话）。
+     * 1.5 让 cap-height 正好占图形高度的一半，三米视距下最稳。
+     *
+     * **改比例只改这一个常量**，其余四处（导航栏 / 空态 / 引导页 / 启动页）自动跟随。
+     */
+    const val LockRatio = 1.5f
+
+    /** 间距占比。标志多大，间距就多宽——不要再写死 8dp / 12dp */
+    const val LockGapRatio = 0.25f
+
+    /** 按法则推出的间距 */
+    fun lockGap(mark: Dp): Dp = mark * LockGapRatio
+
     /** 启动页标志背后的光晕直径（约标志的 3.6 倍，渐变自带软边） */
     val LogoGlow = 360.dp
 
-    /**
-     * 启动页字标相对屏幕中心的纵向偏移。
-     *
-     * LOGO 必须严格居中——系统启动窗口里那颗标志是 gravity=center，
-     * 两边位置对不上，窗口交接的瞬间就会跳一下。
-     * 所以字标不参与居中，靠这个偏移挂到 LOGO 下方：
-     * 标志半高 48 + 间距 24 + 字标块半高约 36。
-     */
-    val WordmarkOffset = 108.dp
+    // 原 WordmarkOffset（字标纵向偏移 108dp）已删除：字标现在与标志同行水平排列，
+    // 标志先居中、随后左滑让位，不再需要把字标往下推。
 }
 
 /**
@@ -199,6 +220,31 @@ object T {
      * 太小在 3 米距离上又认不得字。16sp 是上机反馈后的调整值。
      */
     val Nav = style(16f, 700, 20f, 0.01f)
+
+    /**
+     * 顶部品牌字标，按图形高度推导（见 [D.LockRatio]）。
+     *
+     * 不是常规字阶，也不该被当成标题用：它是「标志 + 品牌名」这一组的另一半，
+     * 尺寸由标志决定——32dp 标志 → 21.3sp，96dp 标志 → 64sp。
+     *
+     * 用 [Density.toSp] 而不是直接 `.sp`：系统字体缩放变化时，字标仍与图形等高，
+     * 不会出现「图标不动、字越调越大」把组合撑散的情况。
+     *
+     * @param markSize 配套图形的边长（dp）
+     */
+    fun brandWordmark(markSize: Dp, density: Density): TextStyle {
+        val size = with(density) { (markSize.toPx() / D.LockRatio).toSp() }
+        return style(
+            size = size.value,
+            weight = 750,
+            lineHeight = size.value * BRAND_LINE,
+            tracking = -0.005f,
+        )
+    }
+
+    /** 品牌字标的行高倍数。比正文紧：字标只有一行，行高只是给字母留呼吸 */
+    private const val BRAND_LINE = 1.25f
+
     val Body1 = style(13f, 400, 22f, 0.01f)
     val Body2 = style(12.5f, 400, 20f, 0.01f)
     val Label = style(11f, 600, 13f, 0.04f)
@@ -283,29 +329,27 @@ object M {
     const val KEY_HINT = 5000L
 
     /**
-     * 启动页总停留时长（从点图标算起，不是从首帧算起）。
+     * 启动动画的固定时长，**从首帧上屏算起**。
      *
-     * 读本地配置只要几十毫秒，纯按"加载完成"关掉的话 LOGO 一闪而过，像闪屏故障；
-     * 2 秒既能把进场动画走完，也不至于让用户等得烦。
+     * 上一版按「点图标后的 2 秒」倒推（`2 秒 - 首帧耗时`），结果同一份节奏有两种观感：
+     * 机器快时首帧只花 200ms，动画被拉到 1.8 秒；机器慢时又撞到 1.4 秒下限。
+     * 而"首帧之前"那段是系统启动窗口（静态 LOGO），时长由设备冷启动决定，
+     * 应用这边既控制不了、也不该拿它去调动画。
+     *
+     * 现在固定 1 秒：位移在进度 0.06 就起步（约 60ms），8 个字母间隔 72ms 依次长出，
+     * 约 730ms 时整组落位。比上一版短 400ms，且不再有开头那段"LOGO 干等着"。
      */
-    const val SPLASH_HOLD = 2000L
+    const val SPLASH_ANIM = 1000L
 
     /**
-     * 进场动画的最短时长。
+     * 启动页绝对上限，**只对「配置读不出来」生效**。
      *
-     * 冷启动慢的机型，首帧出来时 [SPLASH_HOLD] 可能已经用掉大半，
-     * 剩余时间不足时按这个值兜底：宁可整体超时几百毫秒，也不要让动画"啪"一下闪完。
-     */
-    const val SPLASH_MIN_ANIM = 700L
-
-    /**
-     * 启动页绝对上限。
+     * 读配置卡死（Keystore 异常、文件损坏）会让 `ready` 永不为真，
+     * 停在 LOGO 上连设置页都进不去，是最糟的失败形态，到点一律放行。
      *
-     * 谁也不能把用户按在 LOGO 上。两件事都可能拖住启动页：
-     * 动画因为主线程忙而迟迟走不完（电视盒子上很常见），
-     * 以及读配置卡死（Keystore 异常、文件损坏）导致 `ready` 永不为真。
-     * 到这个点一律放行，剩下的交给首页自己去加载——停在 LOGO 上连设置页都进不去，
-     * 是最糟的失败形态。
+     * 它不负责卡动画时长：动画现在按帧推进，慢设备上会被抻长（见 `SplashMotion.step`），
+     * 再用一个秒数把两边一起兜住，会把没播完的动画直接切掉——那正是要修的毛病。
+     * 这里只做最后一道硬闸：动画循环超过它一律收尾，绝不把 LOGO 挂在屏幕上等。
      */
     const val SPLASH_CEILING = 3500L
 }

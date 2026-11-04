@@ -1,7 +1,6 @@
 package com.eleventv.tv
 
 import android.os.Bundle
-import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -13,12 +12,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.media3.common.util.UnstableApi
 import com.eleventv.tv.ui.AppRoot
 import com.eleventv.tv.ui.components.BrandSplash
+import com.eleventv.tv.ui.components.SplashSound
 import com.eleventv.tv.ui.design.C
 import com.eleventv.tv.ui.design.ElevenTheme
 import com.eleventv.tv.ui.design.M
@@ -37,18 +38,17 @@ import kotlinx.coroutines.delay
 @UnstableApi
 class MainActivity : ComponentActivity() {
 
+    /** 启动音效，跟随 [BrandSplash] 的进场动画一起播，活动销毁时释放。 */
+    private lateinit var splashSound: SplashSound
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        /**
-         * 启动页的计时基准：用户点图标的时刻。
-         *
-         * 不能写在 composable 里 `remember` —— 那时首帧已经组合完，
-         * 冷启动慢的机型光首帧就要一秒多，这段会被白白算成"已经停留过"。
-         */
-        val launchedAt = SystemClock.uptimeMillis()
-
         val repo = (application as ElevenApp).repository
+        splashSound = SplashSound(this)
+        // settings 在 Application.onCreate → repo.init() 时已载入，
+        // 这里 .value 拿到的是落盘后的最新配置，不是默认值
+        if (repo.settings.value.splashSound) splashSound.play()
 
         setContent {
             ElevenTheme {
@@ -64,31 +64,52 @@ class MainActivity : ComponentActivity() {
                 var holdDone by remember { mutableStateOf(false) }
 
                 /**
-                 * 兜底放行。
+                 * 兜底放行，只针对「配置读不出来」。
                  *
                  * 正常冷启动 [repo.ready] 几十毫秒就 true，走不到这里；
                  * 但如果读配置这一步出了岔子（Keystore 解不开、文件损坏之类），
                  * 没有兜底就永远停在 LOGO 上——那是最糟的失败形态，连设置页都进不去。
+                 *
+                 * 注意**不能**用同一个秒数顺手卡动画：动画按帧推进，慢设备上会被抻长，
+                 * 一刀切下去就是"动画还没播完就被切走"。动画由它自己跑完回调。
                  */
                 var forced by remember { mutableStateOf(false) }
+                val readyNow = rememberUpdatedState(ready)
                 LaunchedEffect(Unit) {
                     delay(M.SPLASH_CEILING)
-                    forced = true
+                    if (!readyNow.value) forced = true
                 }
 
                 val splash = (!ready || !holdDone) && !forced
 
                 /**
-                 * 首页推迟一帧挂载。
+                 * 首页推迟挂载，直到品牌动画的**主相位**结束。
                  *
-                 * 启动层只有一颗标志和两行字，几十毫秒就能上屏；
-                 * 首页要组合海报墙、测量几十张卡片、发起图片请求。
-                 * 两者塞进同一帧的话，冷启动时用户得盯着启动窗口里的画面等一两秒才看到任何反应——
-                 * 那正是"满屏紫色"的由来。错开一帧，品牌画面先出来，首页在后面悄悄搭。
+                 * 启动层只有一颗标志和一行字，几十毫秒就能上屏；
+                 * 首页要组合海报墙、测量几十张卡片、发起图片请求，在电视盒子上要一两秒。
+                 * 两者塞进同一帧的话，那一帧的主线程被完全占住，动画一帧都画不出来——
+                 * 用户看到的是「启动窗口里的静止 LOGO 停两秒，然后直接跳到完整画面」。
+                 *
+                 * 动画会在进度 0.70 处回调（此时位移已停、字母已全部落位），
+                 * 这时候再去搭首页，剩下的掉帧只影响光晕和进度线，看不出来。
                  */
                 var contentMounted by remember { mutableStateOf(false) }
-                LaunchedEffect(Unit) {
+                var phaseDone by remember { mutableStateOf(false) }
+                LaunchedEffect(phaseDone, forced) {
+                    // 兜底放行时动画层可能压根没跑起来，别让首页等着
+                    if (!phaseDone && !forced) return@LaunchedEffect
                     withFrameNanos { }
+                    contentMounted = true
+                }
+
+                /**
+                 * 最后一道兜底：不管动画层出了什么事，这个时间点之后首页必须挂载。
+                 *
+                 * 只有一个空壳 BOX 的话，用户看到的是纯色背景，比动画不流畅糟糕得多。
+                 * 正常冷启动走不到这里——动画 1.4 秒跑完、首页随即挂上。
+                 */
+                LaunchedEffect(Unit) {
+                    delay(M.SPLASH_CEILING)
                     contentMounted = true
                 }
 
@@ -116,7 +137,8 @@ class MainActivity : ComponentActivity() {
                     // 配置还没读完、或启动动画没走完时，由这层盖住内容
                     BrandSplash(
                         visible = splash,
-                        since = launchedAt,
+                        // 主相位结束（位移停稳、字母落位）——首页可以开始搭了
+                        onMainPhaseEnd = { phaseDone = true },
                         // 可能被回调两次（动画完成 + 超时兜底），直接赋值即幂等
                         onHoldEnd = { holdDone = true },
                     )
@@ -131,5 +153,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        splashSound.release()
     }
 }
