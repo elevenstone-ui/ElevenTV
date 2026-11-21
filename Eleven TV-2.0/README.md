@@ -53,11 +53,16 @@
 
 ## 关于
 
-- **版本**：2.1.12-webdav（versionCode 16）
+- **版本**：2.1.35-webdav（versionCode 39）
 - **最低系统**：Android 8.0（API 26）
 - **目标系统**：Android 15（API 36）
 - **形态**：Android TV / Leanback，横屏固定
 - **数据来源**：TMDB（未获认可或认证）+ Fanart.tv；两者署名见设置页「关于」
-- **构建**：自用签名证书，release 与 debug 包签名不同不互通
-- **源码**：见本目录「ElevenTV-2.0 源码包.zip」
+- **构建**：自用签名证书，release 与 debug 包签名不同不互通；本目录 2.1.35 提供 debug 包（`ElevenTV-2.1.35-webdav-debug.apk`），2.1.12 保留 release 包（`ElevenTV-2.1.12-webdav-release.apk`），两代签名不互通、不可覆盖安装，需先卸载旧版
+- **源码**：见本目录「ElevenTV-2.1.35-webdav-src.zip」（历史包「ElevenTV-2.0 源码包.zip」为 2.1.12，保留不删）
 - **UI 设计稿**：`ElevenTV-UI.html`（3840×2160 1:1，含 Logo 系统 / 视觉规范 / 5 个核心界面）
+
+## 更新记录（节选）
+
+- **2.1.35**：播放失败页遥控器焦点修复（左右切重试/退出、OK 激活）；详情页集数统计「共X集·库里Y集」多季按季展示；详情页黑边修复；播放器顶栏单集名去重；启动音效换 B 律动版；外挂字幕支持
+- **2.1.12**：品牌启动动画 + lockup 3:2 同步 + 启动音效
