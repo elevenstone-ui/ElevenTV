@@ -150,6 +150,12 @@ fun DetailScreen(
 
         // 渐变覆盖层同样全屏：上部留一点剧照让小标题可辨，下部收成不透明 Ink0，
         // 保证选集、简介压在上面时对比度足够。
+        //
+        // 色标在 2.1.33 前后收紧过一次（0.58→92%、0.78→全黑），结果中下部整片被压成纯黑，
+        // 用户看到的就是「详情页没全屏、左右两条黑边」——其实页面是铺满的，只是背景剧照
+        // 在选集区高度完全透不出来，左右边缘全是 Ink0。现在放回柔曲线：
+        // 选集卡行（屏高 55~75%）剧照仍透出 4~6 成，左右边缘有图；
+        // 简介（35~45%）压到半实，艺人/源文件清单（80%+）压到近全黑，可读性不丢。
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -157,9 +163,8 @@ fun DetailScreen(
                     Brush.verticalGradient(
                         colorStops = arrayOf(
                             0.00f to Color.Black.copy(alpha = 0.55f),
-                            0.28f to C.Ink0.copy(alpha = 0.55f),
-                            0.58f to C.Ink0.copy(alpha = 0.92f),
-                            0.78f to C.Ink0,
+                            0.30f to C.Ink0.copy(alpha = 0.45f),
+                            0.62f to C.Ink0.copy(alpha = 0.72f),
                             1.00f to C.Ink0,
                         ),
                     ),
@@ -265,6 +270,23 @@ fun DetailScreen(
                     Column(modifier = Modifier.padding(top = D.Lg)) {
                         // 电影只有一条，标「选集 · 共 1 集」既荒谬又占地方，直接不出标题行
                         if (!isMovie) {
+                            // 按季统计：多季显示「第 N 季 · 共 X 集 · 库里 Y 集」，单季显示「共 X 集 · 库里 Y 集」。
+                            // 多季时某季的总集数只认 seasonEpisodeCounts——整剧 totalEpisodes 套到单季会误导
+                            // （3 季 90 集，某季可能只有 30 集）；单季没有季级数据时才退回整剧 totalEpisodes。
+                            // 都拿不到就只报「库里 Y 集」，绝不拿季数冒充集数。
+                            val multiSeason = entry.seasons.size > 1
+                            val seasonTotal = if (multiSeason) {
+                                entry.seasonEpisodeCounts[season]?.takeIf { it > 0 }
+                            } else {
+                                entry.seasonEpisodeCounts[season]?.takeIf { it > 0 }
+                                    ?: entry.totalEpisodes?.takeIf { it > 0 }
+                            }
+                            val episodeLine = buildList {
+                                if (multiSeason) add("第 $season 季")
+                                if (seasonTotal != null) add("共 $seasonTotal 集")
+                                add("库里 ${episodes.size} 集")
+                                add("左右选择")
+                            }.joinToString(" · ")
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.fillMaxWidth(),
@@ -272,7 +294,7 @@ fun DetailScreen(
                                 TvText("选集", style = T.Title1, color = C.Text1)
                                 HSpace(D.Lg)
                                 TvText(
-                                    text = "共 ${episodes.size} 集 · 左右选择",
+                                    text = episodeLine,
                                     style = T.Caption,
                                     color = C.Text3,
                                     maxLines = 1,
@@ -351,6 +373,20 @@ fun DetailScreen(
                         color = C.Text3,
                         maxLines = 1,
                     )
+                    // 源文件清单：刮削失败/错配时按这里的路径去改文件名或目录名。
+                    // file.path 是「扫描根」下的完整相对路径（含文件名）；share 为共享名
+                    // （WebDAV 下恒为空，不拼前导斜杠）。文件名原样，不做任何清洗。
+                    entry.files.forEach { file ->
+                        val sourcePath = if (file.share.isBlank()) file.path else "${file.share}/${file.path}"
+                        TvText(
+                            text = sourcePath,
+                            style = T.Micro,
+                            color = C.Text3.copy(alpha = 0.8f),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
                 }
             }
         }
@@ -449,7 +485,19 @@ private fun InfoColumn(
                 if (entry.kind == MediaKind.MOVIE) {
                     entry.runtimeMin?.let { "$it 分钟" } ?: "电影"
                 } else {
-                    "共 ${entry.seasons.size} 季 · ${entry.episodeCount} 集"
+                    // 「共 N 集」取数据源的全剧总集数（TMDB/豆瓣），「库里 M 集」是本地实际文件数。
+                    // 两者放一起，缺多少集一眼可见。总集数还没刮到时只报「库里 M 集」，
+                    // 绝不退化成「共 X 季」——季数不能替代集数信息，会让用户误以为统计的是集。
+                    val inLibrary = entry.episodeCount
+                    val total = entry.totalEpisodes?.takeIf { it > 0 }
+                    val multiSeason = entry.seasons.size > 1
+                    when {
+                        total != null && multiSeason ->
+                            "共 $total 集 · 库里 $inLibrary 集 · ${entry.seasons.size} 季"
+                        total != null -> "共 $total 集 · 库里 $inLibrary 集"
+                        multiSeason -> "库里 $inLibrary 集 · ${entry.seasons.size} 季"
+                        else -> "库里 $inLibrary 集"
+                    }
                 },
             )
             entry.rating?.takeIf { it > 0 }?.let { score ->

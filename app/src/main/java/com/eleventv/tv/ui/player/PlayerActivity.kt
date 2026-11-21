@@ -51,7 +51,15 @@ class PlayerActivity : ComponentActivity() {
         val fileId = intent.getStringExtra(EXTRA_FILE_ID)
 
         val entry = entryId?.let { repo.entry(it) }
-        val file = entry?.files?.firstOrNull { it.id == fileId } ?: entry?.primaryFile
+        val requestedFile = entry?.files?.firstOrNull { it.id == fileId }
+        val file = requestedFile ?: entry?.primaryFile
+
+        // 重新扫描后 fileId 可能已变；原来静默回退到第一集，用户会以为进度丢了。
+        if (requestedFile == null && fileId != null && entry != null) {
+            android.widget.Toast
+                .makeText(this, "该集已变更，将播放默认集", android.widget.Toast.LENGTH_SHORT)
+                .show()
+        }
 
         if (entry == null || file == null) {
             // 媒体库可能刚被重新扫描过，条目不在了。
@@ -71,6 +79,14 @@ class PlayerActivity : ComponentActivity() {
             initialFile = file,
             settings = repo.settings.value,
             onExit = { finish() },
+            // 外挂字幕的列目录交给 PlayerState 在起播前于 IO 线程做：
+            // 这里只提供「怎么列」，不在此处 await。setContent 立即执行，
+            // 查字幕期间界面显示的是 buffering，不会黑屏。
+            // 按目录缓存 + 硬超时都在 PlayerState 内，换集到别的季目录会重新列。
+            subtitleSiblings = { target ->
+                val srv = repo.serverOf(target.serverId)
+                if (srv == null) emptyList() else listSiblingNames(srv, repo.smb, target.path)
+            },
             // 播放器里切了解码方式就写回设置：下次进来（含其它片）沿用这个选择
             onDecoderChosen = { chosen ->
                 lifecycleScope.launch { repo.updateSettings { it.copy(decoder = chosen) } }
@@ -136,6 +152,11 @@ class PlayerActivity : ComponentActivity() {
      * 到 compileSdk 36 已经从 android.jar 里彻底移除，直接调用编译不过（Unresolved
      * reference）；而目标机型是 Android 9，只有这一个重载。运行时找一次并缓存，
      * 找不到就静默放弃——主路径的 `FLAG_KEEP_SCREEN_ON` 仍然生效，只是少了这层兜底。
+     *
+     * **兼容边界（需真机回归）**：API 33+ 上该隐藏方法通常已移除，反射返回 null，
+     * 这层「压制国产 ROM 屏保」的兜底实际不生效，只剩 FLAG_KEEP_SCREEN_ON。
+     * 这里不猜测其它系统私有 API、也不因此抛异常；需在 Android 13+ 盒子上静置超过
+     * 系统屏保时间做一次回归，确认画面是否被屏保覆盖，再决定是否另做适配。
      */
     private fun pokeUserActivity(power: PowerManager) {
         val method = userActivityMethod ?: return

@@ -56,6 +56,7 @@ import com.eleventv.tv.ui.components.VSpace
 import com.eleventv.tv.ui.design.C
 import com.eleventv.tv.ui.design.D
 import com.eleventv.tv.ui.design.T
+import com.eleventv.tv.ui.design.focusRing
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -73,10 +74,14 @@ fun SettingsScreen(
     scrapeJob: JobState,
     entryCount: Int,
     scrapedCount: Int,
+    /** 未刮削条目的原始标题，供「未命中清单」对话框取证 */
+    unmatched: List<String>,
     onTest: suspend (SmbServer) -> Result<SmbServer>,
     onSaveServer: (SmbServer) -> Unit,
     onDeleteServer: (String) -> Unit,
     onScan: () -> Unit,
+    /** 停止当前扫描；运行时「扫描媒体库」按钮会变成「停止扫描」并调用它 */
+    onStopScan: () -> Unit,
     onScrapeAll: (Boolean) -> Unit,
     onClearScraped: () -> Unit,
     onDiagnose: suspend () -> List<com.eleventv.tv.data.scrape.ScrapeDiagnostics.Item>,
@@ -106,7 +111,10 @@ fun SettingsScreen(
                 start = D.ScreenPaddingX,
                 end = D.ScreenPaddingX,
                 top = D.Xl,
-                bottom = 80.dp,
+                // 「关于」是最后一项：底部要留够让整张卡片滚到可视区中部，
+                // 避开叠在 BottomCenter 的 KeyHintBar（28dp，进页面后 5 秒才淡出）
+                // 以及电视过扫描裁掉的下边缘。
+                bottom = 120.dp,
             ),
             verticalArrangement = Arrangement.spacedBy(D.X2l),
             modifier = Modifier.fillMaxSize(),
@@ -123,12 +131,15 @@ fun SettingsScreen(
 
                     VSpace(D.Xl)
                     Row(horizontalArrangement = Arrangement.spacedBy(D.Lg)) {
+                        // 扫描进行中把这个按钮变成「停止扫描」：TvButton 的 loading 会
+                        // 吞掉点击、enabled=false 会让它不可聚焦，所以运行时必须
+                        // loading=false / enabled=true，否则遥控器根本按不到停止。
                         TvButton(
-                            onClick = onScan,
-                            label = "扫描媒体库",
-                            icon = R.drawable.ic_scan,
-                            enabled = !scanRunning,
-                            loading = scanRunning,
+                            onClick = if (scanRunning) onStopScan else onScan,
+                            label = if (scanRunning) "停止扫描" else "扫描媒体库",
+                            icon = if (scanRunning) R.drawable.ic_close else R.drawable.ic_scan,
+                            enabled = true,
+                            loading = false,
                         )
                         TvButton(
                             onClick = { onScrapeAll(false) },
@@ -258,6 +269,37 @@ fun SettingsScreen(
                         onEdit = { keyEdit = KeyEdit("Fanart API Key", settings.fanartApiKey) { s, v -> s.copy(fanartApiKey = v) } },
                     )
 
+                }
+            }
+
+            // ---------------- 刮削操作 ----------------
+            // 必须单独成一个 item，不能塞进上面那张「刮削」卡的末尾。
+            //
+            // 刮削卡有 7 个开关 + 3 个凭证行，整卡内容 ~576dp，高于电视一屏。
+            // LazyColumn 的滚动以 item 为单位：item 比视口还高时，bringIntoView
+            // 没法把「item 内部靠下的节点」滚进视野，焦点系统在按 ↓ 时会直接跳过
+            // 它们、落到下一张卡 —— 表现为「网络诊断 / 清除刮削结果」两颗按钮
+            // 焦点上不去、←→ 也切不了，而「关于」卡因为自己是独立 item 才滚得动。
+            // 拆成独立 item 后高度远小于视口，焦点可以正常跨 item 落到按钮上。
+            item("scrapeActions") {
+                SettingsCard(title = "刮削操作") {
+                    KeyRow(
+                        label = "图片反代前缀（可选）",
+                        value = settings.imageBaseUrl,
+                        onEdit = {
+                            keyEdit = KeyEdit("图片反代前缀", settings.imageBaseUrl) { s, v ->
+                                s.copy(imageBaseUrl = v)
+                            }
+                        },
+                    )
+                    ToggleRow(
+                        label = "豆瓣海报优先",
+                        description = "TMDB 图片 CDN 连不上时，用可达的豆瓣海报兜底",
+                        checked = settings.preferDoubanPoster,
+                        onToggle = {
+                            onUpdateSettings { s -> s.copy(preferDoubanPoster = !s.preferDoubanPoster) }
+                        },
+                    )
                     VSpace(D.Lg)
                     Row(horizontalArrangement = Arrangement.spacedBy(D.Lg)) {
                         TvButton(
@@ -283,6 +325,22 @@ fun SettingsScreen(
                             icon = R.drawable.ic_close,
                             variant = TvButtonVariant.Ghost,
                             enabled = scrapedCount > 0,
+                        )
+                        TvButton(
+                            onClick = {
+                                message = "未命中清单（${unmatched.size} 条）" to
+                                    if (unmatched.isEmpty()) {
+                                        "全部条目都已刮削"
+                                    } else {
+                                        "每行：失败原因 ｜ 当前标题 ｜ 文件所在目录名 ｜ 判定类型。\n" +
+                                            "已按失败原因排序，同类问题连在一起；原因来自上一轮刮削，\n" +
+                                            "若显示「本轮未记录原因」，请先跑一次刮削再看。\n\n" +
+                                            unmatched.joinToString("\n") { "· $it" }
+                                    }
+                            },
+                            label = "未命中清单",
+                            icon = R.drawable.ic_metadata,
+                            variant = TvButtonVariant.Ghost,
                         )
                     }
                 }
@@ -392,7 +450,19 @@ fun SettingsScreen(
 
             // ---------------- 关于 ----------------
             item("about") {
-                SettingsCard(title = "关于") {
+                SettingsCard(
+                    title = "关于",
+                    // 这是 LazyColumn 最后一项，内部又全是纯展示文本 —— 一个可聚焦节点都没有。
+                    // TV 上滚动靠焦点 bringIntoView：焦点到不了这张卡片，按 ↓ 就停在上一个
+                    // ToggleRow，卡片下半截（含 TMDB 条款声明）永远进不了可视区。
+                    // 前两次分别调了 maxLines 和底部留白，都只解决「文本被裁」，
+                    // 对「根本滚不下去」无效。focusRing(onClick = null) 只接收焦点、不响应 OK，
+                    // 让整张卡片成为焦点目标，按 ↓ 时把整卡带进视野。
+                    modifier = Modifier.focusRing(
+                        onClick = null,
+                        shape = RoundedCornerShape(12.dp),
+                    ),
+                ) {
                     // 标志与字标同样是 3:2 的组合：28dp 标志 → 18.7sp 字标、7dp 间距。
                     // 间距不能用 D.Xl：它是内容间距，不是图形与字标的关系值。
                     Row(
@@ -424,15 +494,24 @@ fun SettingsScreen(
                     VSpace(D.Xl)
                     TvText("数据来源", style = T.Label, color = C.Text3)
                     VSpace(D.Xs)
-                    InfoRow("TMDB", "影片信息、评分与海报。本产品使用 TMDB API，但未获得 TMDB 认可或认证。")
-                    InfoRow("Fanart.tv", "部分剧照与背景图。图片版权归原作者所有。")
+                    // 条款要求的署名不允许省略：TvText 默认 overflow=Ellipsis，
+                    // 一旦限行数就会把末尾截掉，宽屏看似够用，遇到大字体/窄屏/过扫描就露馅。
+                    InfoRow(
+                        "TMDB",
+                        "影片信息、评分与海报。本产品使用 TMDB API，但未获得 TMDB 认可或认证。",
+                        valueMaxLines = Int.MAX_VALUE,
+                    )
+                    InfoRow(
+                        "Fanart.tv",
+                        "部分剧照与背景图。图片版权归原作者所有。",
+                        valueMaxLines = Int.MAX_VALUE,
+                    )
                     VSpace(D.Xs)
                     TvText(
-                        // TMDB 品牌规范里指定的原句，保留英文原文便于对照
+                        // TMDB 品牌规范里指定的原句，保留英文原文便于对照，且不设行数上限
                         text = "This product uses the TMDB API but is not endorsed or certified by TMDB.",
                         style = T.Caption,
                         color = C.Text3,
-                        maxLines = 2,
                     )
                 }
             }

@@ -43,12 +43,20 @@ object SecretBox {
             val body = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
             PREFIX + Base64.encodeToString(cipher.iv + body, Base64.NO_WRAP)
         }.getOrElse { e ->
-            Log.w(TAG, "凭证加密失败，按明文保存", e)
+            // 安全降级必须留痕：本设备 Keystore 不可用，密码将以明文写入 servers.json。
+            // 这里只补日志、不改返回值，保证「没有可用 Keystore 也不能让人登不上 NAS」的兼容策略不变。
+            Log.w(TAG, "凭证加密失败：Keystore 不可用，密码将以【明文】写入 servers.json（需提示用户）", e)
             plain
         }
     }
 
-    fun open(stored: String): String {
+    /**
+     * 解密；失败返回 null，让调用方能区分「解不开」与「本来就是空密码」。
+     *
+     * 返回 null 时调用方必须保留原始密文，绝不能把空串回写到 servers.json ——
+     * Keystore 被重置后若再触发一次保存，原密文会被永久覆盖。
+     */
+    fun tryOpen(stored: String): String? {
         if (!stored.startsWith(PREFIX)) return stored
         return runCatching {
             val raw = Base64.decode(stored.removePrefix(PREFIX), Base64.NO_WRAP)
@@ -57,9 +65,12 @@ object SecretBox {
             String(cipher.doFinal(raw.copyOfRange(IV_BYTES, raw.size)), Charsets.UTF_8)
         }.getOrElse { e ->
             Log.w(TAG, "凭证解密失败（Keystore 可能被重置），需要重新填写密码", e)
-            ""
+            null
         }
     }
+
+    /** 兼容旧调用：解不开时返回空串。需要保护密文的路径请用 [tryOpen]。 */
+    fun open(stored: String): String = tryOpen(stored) ?: ""
 
     /**
      * 取（或首次生成）本地密钥。

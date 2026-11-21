@@ -17,8 +17,19 @@ import org.junit.Test
  */
 class FilenameParserTest {
 
-    private fun parse(fileName: String, relPath: String, numericEpisode: Boolean = false) =
-        FilenameParser.parse(fileName, relPath, numericEpisode)
+    private fun parse(
+        fileName: String,
+        relPath: String,
+        numericEpisode: Boolean = false,
+        numericEpisodeNumber: Int? = null,
+        sameDirVideoFiles: Int = 1,
+    ) = FilenameParser.parse(
+        fileName = fileName,
+        relPath = relPath,
+        numericEpisode = numericEpisode,
+        numericEpisodeNumber = numericEpisodeNumber,
+        sameDirVideoFiles = sameDirVideoFiles,
+    )
 
     // ---------------- 纯数字集号（本次修复的核心） ----------------
 
@@ -49,6 +60,20 @@ class FilenameParserTest {
         val a = parse("01.mkv", "剧集/Show/01.mkv", numericEpisode = true)
         val b = parse("02.mkv", "剧集/Show/02.mkv", numericEpisode = true)
         assertEquals(a.mergeKey, b.mergeKey)
+    }
+
+    @Test
+    fun `合集目录不顶掉各影片的自己的文件名`() {
+        // /电影/宫崎骏系列/ 下有多部宫崎骏电影（同目录 ≥2 个视频）
+        val p = parse("千与千寻.mkv", "电影/宫崎骏系列/千与千寻.mkv", sameDirVideoFiles = 8)
+        assertEquals("千与千寻", p.title)
+    }
+
+    @Test
+    fun `单片目录仍优先用目录名`() {
+        // 一部影片一文件夹（目录内只有 1 个视频）→ 目录名比文件名干净，照旧优先
+        val p = parse("千与千寻.2001.1080p.x264.mkv", "电影/千与千寻 (2001)/千与千寻.2001.1080p.x264.mkv")
+        assertEquals("千与千寻", p.title)
     }
 
     // ---------------- 每集一个文件夹 ----------------
@@ -201,5 +226,110 @@ class FilenameParserTest {
         assertEquals(2001, a.year ?: -1)
         assertEquals(2005, b.year ?: -1)
         assertNotEquals(a.year, b.year)
+    }
+
+    // ---------------- 数字嵌在文件名任意位置 ----------------
+
+    @Test
+    fun `episodeNumbersInName 能提出嵌在中间的数字并排除了年份分辨率编码`() {
+        assertEquals(listOf(7), FilenameParser.episodeNumbersInName("Show_07_xxx.mkv"))
+        assertEquals(listOf(3), FilenameParser.episodeNumbersInName("xxx03xxx.2019.1080p.x264.mkv"))
+        assertEquals(emptyList<Int>(), FilenameParser.episodeNumbersInName("Movie.2019.1080p.x264.mkv"))
+    }
+
+    @Test
+    fun `统计端给出的集号直接生效且剧名回落到目录`() {
+        val p = parse(
+            "Show.EP07.Title.mkv",
+            "剧集/Show/Season 1/Show.EP07.Title.mkv",
+            numericEpisodeNumber = 7,
+        )
+        assertEquals(7, p.episode ?: -1)
+        assertEquals("Show", p.title)
+    }
+
+    @Test
+    fun `字幕组方括号里的纯数字集号能提出来且不误收年份和分辨率`() {
+        assertEquals(
+            listOf(4),
+            FilenameParser.episodeNumbersInName("[GM-Team][国漫][刺客伍六七][2019][04][上篇].mkv"),
+        )
+        assertEquals(
+            listOf(6),
+            FilenameParser.episodeNumbersInName("[GM-Team][国漫][刺客伍六七][2019][06][下篇].mkv"),
+        )
+        // [2019] 是 4 位、[1080P] 不是纯数字，都不能当集号
+        assertNull(FilenameParser.episodeNumbersInName("[GM-Team][2019][1080P].mkv").firstOrNull())
+    }
+
+    @Test
+    fun `方括号集号经统计端传入后剧名回落目录`() {
+        val p = parse(
+            "[GM-Team][国漫][刺客伍六七][2019][04][上篇].mkv",
+            "动漫/刺客伍六七/[GM-Team][国漫][刺客伍六七][2019][04][上篇].mkv",
+            numericEpisodeNumber = 4,
+        )
+        assertEquals(4, p.episode ?: -1)
+        assertEquals("刺客伍六七", p.title)
+    }
+
+    @Test
+    fun `数字不在开头时也能判成集号`() {
+        val a = parse("Show_01_alpha.mkv", "剧集/Show/Season 1/Show_01_alpha.mkv", numericEpisodeNumber = 1)
+        val b = parse("Show_02_alpha.mkv", "剧集/Show/Season 1/Show_02_alpha.mkv", numericEpisodeNumber = 2)
+        assertEquals(1, a.episode ?: -1)
+        assertEquals(2, b.episode ?: -1)
+        assertEquals(a.mergeKey, b.mergeKey)
+    }
+
+    // ---------------- 电影优先目录名 ----------------
+
+    @Test
+    fun `电影片名优先取最近一级目录名而不是脏文件名`() {
+        val p = parse(
+            "Resident.Evil.2026.AMZN.KyoGo.1080p.mkv",
+            "Multimedia/Movie/Resident Evil (2026)/Resident.Evil.2026.AMZN.KyoGo.1080p.mkv",
+        )
+        assertNull(p.episode)
+        assertEquals("Resident Evil", p.title)
+    }
+
+    @Test
+    fun `电影散放在根目录时回落到文件名而非把容器名当片名`() {
+        // 最近一级是 Movie（容器），不能往上把 Multimedia/共享名当成片名
+        val p = parse("The.Matrix.1999.1080p.mkv", "Multimedia/Movie/The.Matrix.1999.1080p.mkv")
+        assertNull(p.episode)
+        assertEquals("The Matrix", p.title)
+    }
+
+    @Test
+    fun `电影目录名带季号或碟号时不采用`() {
+        val a = parse("Inception.2010.mkv", "Movie/Inception (2010)/Disc 1/Inception.2010.mkv")
+        assertEquals("Inception", a.title)
+    }
+
+    @Test
+    fun `剧集仍按原逻辑取目录名且mergeKey不变`() {
+        val p = parse("Show.S01E01.1080p.mkv", "剧集/Show (2019)/Season 1/Show.S01E01.1080p.mkv")
+        assertEquals("Show", p.title)
+        assertEquals(1, p.episode ?: -1)
+        assertTrue(p.mergeKey.startsWith("series|"))
+    }
+
+    @Test
+    fun `刮削阶段可从文件路径现算干净目录名`() {
+        assertEquals(
+            "Resident Evil",
+            FilenameParser.directoryTitle(
+                "Multimedia/Movie/Resident Evil (2026)/Resident.Evil.2026.AMZN.KyoGo.mkv",
+            ),
+        )
+        assertEquals("流浪地球", FilenameParser.directoryTitle("Movie/流浪地球 (2019)/xxx.mkv"))
+    }
+
+    @Test
+    fun `刮削阶段目录名对容器与季目录返回空`() {
+        assertNull(FilenameParser.directoryTitle("Multimedia/Movie/The.Matrix.1999.mkv"))
+        assertNull(FilenameParser.directoryTitle("剧集/Show/Season 1/Show.S01E01.mkv"))
     }
 }

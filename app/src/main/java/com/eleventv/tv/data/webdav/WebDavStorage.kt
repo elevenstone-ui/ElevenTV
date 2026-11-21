@@ -180,6 +180,9 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
                 if (attempt >= 1) throw e
             }
             attempt++
+            // list() 是同步方法，调用方都在 Dispatchers.IO；退避一小段避免两次请求
+            // 撞进 NAS 同一个过载窗口。不改方法签名，RemoteStorage 接口保持不变。
+            runCatching { Thread.sleep(RETRY_BACKOFF_MS) }
             Log.w(TAG, "PROPFIND 重试一次：$url")
         }
     }
@@ -189,6 +192,8 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
     // ---------------- HTTP ----------------
 
     private fun request(url: String, depth: Int, hop: Int = 0): List<RemoteEntry> {
+        // 所有报错文案统一用脱敏后的 URL，避免 query 里的 token 进 logcat / UI
+        val safeUrl = url.safeForLog()
         val body = PROPFIND_BODY.toByteArray(Charsets.UTF_8)
         val headers = buildMap {
             put("Depth", depth.toString())
@@ -209,7 +214,7 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
             )
         } catch (e: java.net.SocketTimeoutException) {
             throw DavException(
-                "WebDAV 连接超时（${READ_TIMEOUT_MS / 1000} 秒无响应）：地址或端口不通；请求 $url",
+                "WebDAV 连接超时（${READ_TIMEOUT_MS / 1000} 秒无响应）：地址或端口不通；请求 $safeUrl",
                 e,
                 retryable = true,
             )
@@ -223,7 +228,7 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
             throw DavException("域名解析失败（${server.host}）：局域网里直接填 IP 更稳", e)
         } catch (e: IOException) {
             // 服务器把连接掐了、或者返回了半截响应。局域网抖动居多，值得重试一次
-            throw DavException("WebDAV 连接中断：${e.message ?: "连接被关闭"}；请求 $url", e, retryable = true)
+            throw DavException("WebDAV 连接中断：${e.message ?: "连接被关闭"}；请求 $safeUrl", e, retryable = true)
         }
 
         // PROPFIND 不是 GET，Java 的自动跳转不会生效；补 `/` 或 http→https 的跳转得自己跟
@@ -238,9 +243,13 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
         // 报错必须带上真实请求的 URL：用户拿这一行直接粘到电脑浏览器里，
         // 就能把「App 参数错」和「NAS 没开 WebDAV / 端口不对」区分开，
         // 否则只能在电视上反复试，一次一条猜测。
-        val where = "；请求 $url"
+        val where = "；请求 $safeUrl"
         when (response.code) {
             in 200..299 -> Unit
+            // 303 语义要求改用 GET，不能继续用 PROPFIND 跟随；给明确提示而不是绕圈
+            303 -> throw DavException(
+                "WebDAV 返回 303（要求改用 GET），PROPFIND 无法继续跟随；检查路径前缀与末尾斜杠$where",
+            )
             401 -> throw DavException(
                 "WebDAV 认证失败（401）：检查用户名与密码" +
                     (if (server.username.isBlank()) "——当前未填写用户名" else "") + where,
@@ -295,10 +304,19 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
         else -> ""
     }
 
+    /** 报错文案用的 URL：保留 scheme/host/port/path，去掉可能含 token 的 query */
+    private fun String.safeForLog(): String = runCatching {
+        val u = URI(this)
+        "${u.scheme}://${u.host}${if (u.port > 0) ":${u.port}" else ""}${u.rawPath.orEmpty()}"
+    }.getOrDefault(substringBefore('?'))
+
     // ---------------- XML ----------------
 
     private fun parse(input: java.io.InputStream, requestUrl: String): List<RemoteEntry> {
         val selfPath = runCatching { URI(requestUrl).path.orEmpty().trimEnd('/') }.getOrDefault("")
+        // href 编码形式未必与请求 URL 一致（绝对 URL / %20 vs 空格 / 末尾斜杠）。
+        // 两种形态都比一次，避免把「目录自己」当成子项 —— 漏判会让 walk 一路递归到深度上限。
+        val selfRawPath = runCatching { URI(requestUrl).rawPath.orEmpty().trimEnd('/') }.getOrDefault("")
 
         val parser = Xml.newPullParser()
         // 开命名空间：各家 NAS 的前缀五花八门（`D:`、`d:`、`lp1:`、无前缀），
@@ -339,8 +357,12 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
                     if (link != null) {
                         val path = decodedPath(link, requestUrl)
                         // 第一项永远是目录自己（Depth:1 的语义），它不是「子项」
-                        val isSelf = path.trimEnd('/') == selfPath
-                        val name = path.trimEnd('/').substringAfterLast('/')
+                        val normalized = path.trimEnd('/')
+                        val linkRaw = runCatching { URI(link).rawPath.orEmpty().trimEnd('/') }
+                            .getOrDefault("")
+                        val isSelf = normalized == selfPath ||
+                            (linkRaw.isNotEmpty() && linkRaw == selfRawPath)
+                        val name = normalized.substringAfterLast('/')
                         if (!isSelf && name.isNotEmpty()) {
                             out += RemoteEntry(
                                 name = name,
@@ -407,7 +429,10 @@ class WebDavStorage(private val server: SmbServer) : RemoteStorage {
         const val READ_TIMEOUT_MS = 30_000
         const val USER_AGENT = "ElevenTV/2.1 (Android TV)"
         const val PATH_HINT = " 路径前缀（basePath）是否与 NAS 上的共享目录一致"
-        val REDIRECTS = setOf(301, 302, 303, 307, 308)
+        // 303 语义要求改用 GET，不能继续用 PROPFIND 跟随，故不列入自动跳转
+        val REDIRECTS = setOf(301, 302, 307, 308)
+        /** 重试前的静置：立刻重打容易撞上 NAS 同一个过载窗口 */
+        const val RETRY_BACKOFF_MS = 400L
 
         val PROPFIND_BODY = """
             <?xml version="1.0" encoding="utf-8"?>

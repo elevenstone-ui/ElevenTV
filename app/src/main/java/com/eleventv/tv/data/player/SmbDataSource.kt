@@ -55,6 +55,23 @@ object SmbIoStats {
         lastError = null
     }
 
+    // 计数统一在对象锁内累加。@Volatile 只保证可见性，+= / ++ 是读-改-写，
+    // 播放器的 IO 线程与统计刷新并发时会丢计数（reset 用的也是这把锁）。
+    @Synchronized fun addRead(n: Int) {
+        bytesRead += n
+        readCalls++
+    }
+
+    @Synchronized fun incOpen() { openCalls++ }
+
+    @Synchronized fun addOpenCost(ms: Long) { openCostMs += ms }
+
+    @Synchronized fun incReconnect() { reconnects++ }
+
+    @Synchronized fun noteFirstRead(ms: Long) {
+        if (firstReadCostMs < 0) firstReadCostMs = ms
+    }
+
     fun summary(): String = when {
         !active -> ""
         bytesRead <= 0 ->
@@ -154,7 +171,7 @@ class SmbDataSource(
         prefetchStart = -1L
         prefetchLength = 0
 
-        SmbIoStats.openCostMs += (System.nanoTime() - beginAt) / 1_000_000
+        SmbIoStats.addOpenCost((System.nanoTime() - beginAt) / 1_000_000)
 
         transferStarted(dataSpec)
         transferring = true
@@ -171,7 +188,7 @@ class SmbDataSource(
     private fun openHandle(target: String): SmbFile {
         var last: Exception? = null
         for (attempt in 0 until OPEN_ATTEMPTS) {
-            SmbIoStats.openCalls++
+            SmbIoStats.incOpen()
             try {
                 return pool.with(server) { conn -> conn.open(target) }
             } catch (e: SmbException) {
@@ -211,15 +228,23 @@ class SmbDataSource(
         // 真正去 NAS 要数据。连接中途死掉时在这里原地重连，对 ExoPlayer 完全透明——
         // 直接把异常抛出去，播放就终止了，用户看到的是「播几分钟就卡住/失败」。
         var attempt = 0
+        // 长度未知时不能「一次 0 字节就认 EOF」：那可能是连接半死，会被误判成播完
+        // 并触发自动下一集。连续两次读到 0 才收尾，中间给一次就地重连的机会。
+        var zeroReadStreak = 0
         while (true) {
             val file = handle ?: return C.RESULT_END_OF_INPUT
             var reason: String
             try {
                 val n = readFromServer(file, target, offset, toRead)
                 if (n > 0) return n
+                zeroReadStreak++
                 // 0 / -1 = 服务器说没数据了。已知长度却还有剩余时先怀疑连接半死：
                 // 重连再读一次，两次都读不到才认 EOF（否则会把「断线」当成「播完」）。
-                if (bytesRemaining == Long.MAX_VALUE || attempt >= RECOVER_ATTEMPTS) return eof()
+                if (bytesRemaining == Long.MAX_VALUE) {
+                    if (zeroReadStreak >= 2) return eof()
+                } else if (attempt >= RECOVER_ATTEMPTS) {
+                    return eof()
+                }
                 reason = "读到 0 字节"
             } catch (e: Exception) {
                 SmbIoStats.lastError = e.message ?: e.javaClass.simpleName
@@ -260,8 +285,7 @@ class SmbDataSource(
         if (toRead >= PREFETCH_BYTES) {
             val n = file.read(readPosition, target, offset, toRead)
             if (n > 0) {
-                SmbIoStats.bytesRead += n
-                SmbIoStats.readCalls++
+                SmbIoStats.addRead(n)
                 advance(n)
             }
             return n
@@ -277,17 +301,14 @@ class SmbDataSource(
         val beginAt = System.nanoTime()
         val filled = file.read(readPosition, prefetch, 0, want)
         if (filled <= 0) return filled
-        SmbIoStats.bytesRead += filled
-        SmbIoStats.readCalls++
+        SmbIoStats.addRead(filled)
         prefetchStart = readPosition
         prefetchLength = filled
 
         val n = minOf(toRead, filled)
         System.arraycopy(prefetch, 0, target, offset, n)
         advance(n)
-        if (SmbIoStats.firstReadCostMs < 0) {
-            SmbIoStats.firstReadCostMs = (System.nanoTime() - beginAt) / 1_000_000
-        }
+        SmbIoStats.noteFirstRead((System.nanoTime() - beginAt) / 1_000_000)
         return n
     }
 
@@ -308,7 +329,7 @@ class SmbDataSource(
         prefetchLength = 0
         pool.invalidate(server)
         handle = openHandle(path)
-        SmbIoStats.reconnects++
+        SmbIoStats.incReconnect()
     }
 
     private fun eof(): Int {

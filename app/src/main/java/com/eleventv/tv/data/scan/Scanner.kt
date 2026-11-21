@@ -103,13 +103,18 @@ class Scanner(private val pool: SmbPool) {
         for (server in servers.filter { it.enabled }) {
             val counter = intArrayOf(0)
 
-            val onFile: (RemoteEntry, String, MediaKind?) -> Unit = { entry, relPath, kindOverride ->
+            val onFile: (RemoteEntry, String, MediaKind?) -> Unit = onFile@{ entry, relPath, kindOverride ->
                 coroutineContext.ensureActive()
-                counter[0]++
 
+                // 只扫描视频文件：海报 jpg、元数据 nfo、字幕 srt 之类的附属文件
+                // 在遍历回调入口就丢掉，连「已扫描 N」计数与进度路径都不参与。
+                // 以前白名单只挡住了「入库」，这些文件仍被计数、还会把 currentPath
+                // 显示成 xxx.jpg，看起来像在扫一堆图片，也把进度数字灌水。
                 val ext = entry.name.substringAfterLast('.', "").lowercase()
-                val accepted = ext in allowedExt &&
-                    (entry.sizeBytes <= 0 || entry.sizeBytes >= minBytes)
+                if (ext !in allowedExt) return@onFile
+
+                counter[0]++
+                val accepted = entry.sizeBytes <= 0 || entry.sizeBytes >= minBytes
 
                 if (accepted) {
                     val id = "${server.id}|${server.share}|$relPath"
@@ -157,17 +162,22 @@ class Scanner(private val pool: SmbPool) {
 
         if (failedDirs > 0) Log.w(TAG, "有 $failedDirs 个目录读取失败，本次扫描结果可能不完整")
 
-        // 第二遍：先把「哪些目录是用 01/02/03 当集号」统计出来，再解析。
-        // 这一步不能省——`/剧集/Show/01.mkv` 这种文件夹，纯看文件名无从判断
-        // `01` 是第 1 集还是片名，于是每个文件都成了一条独立「电影」。
+        // 第二遍：先把「哪些目录靠文件名里的连续数字当集号」统计出来，再解析。
+        // 这一步不能省——`/剧集/Show/xxx01xxx.mkv` 这种命名，纯看一个文件
+        // 无从判断 `01` 是第 1 集还是片名，于是每集都成了一条独立「电影」。
         val numericDirs = numericEpisodeDirs(raw)
+        // 每个目录里有多少视频文件：≥2 说明是「合集/导演文件夹」，目录名不能当片名
+        val videoCountByDir = raw.groupingBy { it.dirKey }.eachCount()
         val found = ArrayList<Found>(raw.size)
         for (r in raw) {
             coroutineContext.ensureActive()
+            val episodeFromDir = numericDirs[r.dirKey]?.get(r.id)
             val parsed = FilenameParser.parse(
                 fileName = r.fileName,
                 relPath = r.relPath,
-                numericEpisode = r.dirKey in numericDirs,
+                numericEpisode = episodeFromDir != null,
+                numericEpisodeNumber = episodeFromDir,
+                sameDirVideoFiles = videoCountByDir[r.dirKey] ?: 1,
             )
             found += Found(
                 file = MediaFile(
@@ -209,7 +219,10 @@ class Scanner(private val pool: SmbPool) {
     ): Int {
         var failed = 0
         for (root in server.roots) {
-            failed += walk(storage, root.path, depth = 0) { entry, relPath ->
+            // visited 按根独立：两个根存在包含关系时（/Video 与 /Video/Tv），后一个根仍要
+            // 按自己的 kindOverride 走一遍，否则类型覆写会丢。防环只针对「单个根内部的目录自引用」。
+            val visited = HashSet<String>()
+            failed += walk(storage, root.path, depth = 0, visited) { entry, relPath ->
                 onFile(entry, relPath, root.kind)
             }
         }
@@ -225,9 +238,21 @@ class Scanner(private val pool: SmbPool) {
         storage: RemoteStorage,
         path: String,
         depth: Int,
+        visited: MutableSet<String>,
         onFile: (RemoteEntry, String) -> Unit,
     ): Int {
-        if (depth > MAX_DEPTH) return 0
+        if (depth > MAX_DEPTH) {
+            // 超深目录必须计入失败：return 0 会让「零结果保护」和「失败目录增量合并」
+            // 两条兜底都不触发，深层目录里的片子被静默丢弃，界面还写着「扫描完成」。
+            Log.w(TAG, "目录层级超过 $MAX_DEPTH，已跳过：$path")
+            return 1
+        }
+        // 服务器返回的 href 与请求 URL 编码形式不一致时，目录会把自己列成子项。
+        // 不给环加一道闸，walk 会一路递归到深度上限并产生大量重复条目。
+        if (!visited.add(path.trimEnd('/'))) {
+            Log.w(TAG, "检测到重复目录路径，已跳过：$path")
+            return 0
+        }
         val items = runCatching { storage.list(path) }.getOrElse { e ->
             Log.w(TAG, "跳过目录 $path：${e.message}")
             return 1
@@ -239,7 +264,11 @@ class Scanner(private val pool: SmbPool) {
             if (item.name.lowercase() in SKIP_DIRS) continue
 
             val child = if (path.isBlank()) item.name else "$path/${item.name}"
-            if (item.isDirectory) failed += walk(storage, child, depth + 1, onFile) else onFile(item, child)
+            if (item.isDirectory) {
+                failed += walk(storage, child, depth + 1, visited, onFile)
+            } else {
+                onFile(item, child)
+            }
         }
         return failed
     }
@@ -251,34 +280,52 @@ class Scanner(private val pool: SmbPool) {
      * `01` 是第 1 集还是片名；`TRAILING_NUM_EP` 还要求数字前有分隔符，
      * 纯数字文件名连它都进不去，于是 12 集变成 12 个独立「电影」条目。
      *
-     * 放进目录上下文就有强信号：同一目录下有若干个互不重复的短数字文件，
+     * 放进目录上下文就有强信号：同一目录下有若干个短数字文件，
      * 几乎一定是一部剧的分集——电影不会按 01..12 编号并排摆放。
      * 只认 1~3 位数字，所以 `2012.mkv`、`1917.mkv`（片名就是年份）不会进来；
      * 也要求至少两个，`/电影/某片/1.mkv` 这种孤例不受影响。
+     * 计数用 List 而不是 Set：`01.mkv` 与 `1.mkv` 归一化后都是第 1 集，
+     * 去重会让「目录里明明有多个编号文件」的信号凭空消失（多版本压制的常见摆放）。
      *
      * 已知取舍：`/电影/诺兰合集/01.mkv 02.mkv` 这类「按序号摆放的电影合集」
      * 会被当成一部剧。相比「每个文件一条、海报墙全是数字标题」，
      * 这个方向的误判更容易被发现和手工整理。
      */
-    private fun numericEpisodeDirs(raw: List<RawFile>): Set<String> {
-        val byDir = HashMap<String, MutableSet<Int>>()
+    /**
+     * 判定「哪些目录是靠文件名里的连续数字当集号」，并给出**每个文件的集号**。
+     *
+     * 数字可以在文件名任意位置（`Show_01_xxx.mkv`、`xxx02xxx.mkv`），
+     * 不再要求开头。判定用「同目录候选数字构成连续序列」这个强信号：
+     * 至少 2 个不同的数字、且排序后是连续递增（允许同集多版本）。
+     * 这样 `/电影/合集/01.mkv 02.mkv` 仍会误判成剧集 —— 这是既有取舍，
+     * 但比「每个文件一条、海报墙全是数字标题」更容易发现。
+     *
+     * @return dirKey → (文件 id → 集号)
+     */
+    private fun numericEpisodeDirs(raw: List<RawFile>): Map<String, Map<String, Int>> {
+        val byDir = HashMap<String, MutableList<Pair<RawFile, List<Int>>>>()
         for (r in raw) {
-            val num = leadingEpisodeNumber(r.fileName) ?: continue
-            byDir.getOrPut(r.dirKey) { HashSet() } += num
+            val nums = FilenameParser.episodeNumbersInName(r.fileName)
+            if (nums.isEmpty()) continue
+            byDir.getOrPut(r.dirKey) { ArrayList() } += r to nums
         }
-        return byDir.filterValues { it.size >= 2 }.keys
-    }
 
-    /** 文件名开头的集号：`01.mkv`、`01 标题.mkv`、`01v2.mkv`；不是这种形态返回 null */
-    private fun leadingEpisodeNumber(fileName: String): Int? {
-        val base = fileName.substringBeforeLast('.')
-        val digits = base.takeWhile { it.isDigit() }
-        // 4 位以上一律不认：那是 `2012`、`1917` 这类片名里的年份
-        if (digits.isEmpty() || digits.length > 3) return null
-        val rest = base.substring(digits.length)
-        // 数字后面必须紧跟结尾或分隔符，排除 `1080p`、`2160p` 这类
-        if (rest.isNotEmpty() && rest[0] !in " ._-") return null
-        return digits.toIntOrNull()?.takeIf { it in 1..999 }
+        val out = HashMap<String, Map<String, Int>>()
+        for ((dirKey, files) in byDir) {
+            if (files.size < 2) continue
+
+            // 每个文件只保留一个「能和邻居排成序列」的数字。
+            // 多数文件只有一个候选；多个候选时取最小且 >=1 的那个（片名里
+            // 的大数字通常是年份/分辨率残留，已被 episodeNumbersInName 剥掉）。
+            val picked = files.map { (file, nums) -> file.id to nums.min() }
+            val distinct = picked.map { it.second }.distinct().sorted()
+            // 连续序列判据：≥2 个不同编号，且跨度不超过「编号个数 + 2」
+            // （允许缺一两集，例如 01/02/04；跨度过大说明是片名数字，不是集号）
+            if (distinct.size < 2) continue
+            if (distinct.last() - distinct.first() > distinct.size + 2) continue
+            out[dirKey] = picked.toMap()
+        }
+        return out
     }
 
     /**
@@ -348,7 +395,14 @@ class Scanner(private val pool: SmbPool) {
 
         items.filter { it.parsed.year == null }
             .takeIf { it.isNotEmpty() }
-            ?.let { unknown -> clusters.maxByOrNull { it.files.size }?.files?.addAll(unknown) }
+            ?.let { unknown ->
+                clusters.maxByOrNull { it.files.size }?.let { cluster ->
+                    cluster.files.addAll(unknown)
+                    // 并入文件必须同时并入集号：下面判「是不是同一部剧」完全依赖 eps，
+                    // 偏小的集合会让本该拆开的两部同名剧被判成「集号不撞」而错误合并。
+                    cluster.eps.addAll(epKeys(unknown))
+                }
+            }
 
         var merged = true
         while (merged && clusters.size > 1) {
@@ -358,7 +412,9 @@ class Scanner(private val pool: SmbPool) {
                     // 集号不撞 → 同一部剧的不同季（S1 与 S3 不会都有 E01）；
                     // 年份差 ≤1 → 同一部剧的压制年/播出年误差，不该拆。
                     // 两条都不满足才认定是「同名不同剧」（The Office 2001 / 2005）。
-                    val disjoint = clusters[i].eps.intersect(clusters[j].eps).isEmpty()
+                    // none 而不是 intersect：后者每比较一对簇就新建一个临时 Set，
+                    // 合并循环里会产生大量短命对象；判空语义完全一致。
+                    val disjoint = clusters[i].eps.none { it in clusters[j].eps }
                     val closeYear = kotlin.math.abs(clusters[i].year - clusters[j].year) <= 1
                     if (disjoint || closeYear) {
                         clusters[i].files += clusters[j].files
@@ -388,15 +444,22 @@ class Scanner(private val pool: SmbPool) {
 
         // 形态 / 标题 / 年份取「多数票」，而不是「排序后的第一个文件」：
         // 一个 bucket 里混入特别篇、样片时，第一条未必代表整部剧（以前就是这么错的）。
+        // 三张票原本各跑一次 groupingBy（三次全量遍历 + 三次临时 Map），合并为一次遍历。
+        // 用 LinkedHashMap 保持插入顺序，平票时 maxByOrNull 的取值与 groupingBy 完全一致。
+        val kindVotes = LinkedHashMap<MediaKind, Int>()
+        val yearVotes = LinkedHashMap<Int, Int>()
+        val titleVotes = LinkedHashMap<String, Int>()
+        for (f in items) {
+            val p = f.parsed
+            kindVotes[p.kind] = (kindVotes[p.kind] ?: 0) + 1
+            p.year?.let { y -> yearVotes[y] = (yearVotes[y] ?: 0) + 1 }
+            if (p.title.isNotBlank()) titleVotes[p.title] = (titleVotes[p.title] ?: 0) + 1
+        }
         val kind = sorted.firstNotNullOfOrNull { it.kindOverride }
-            ?: items.groupingBy { it.parsed.kind }.eachCount()
-                .maxByOrNull { it.value }?.key
-            ?: com.eleventv.tv.data.model.MediaKind.SERIES
-        val year = items.mapNotNull { it.parsed.year }
-            .groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
-        val title = items.map { it.parsed.title }.filter { it.isNotBlank() }
-            .groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
-            ?: items.first().parsed.title
+            ?: kindVotes.maxByOrNull { it.value }?.key
+            ?: MediaKind.SERIES
+        val year = yearVotes.maxByOrNull { it.value }?.key
+        val title = titleVotes.maxByOrNull { it.value }?.key ?: items.first().parsed.title
 
         return LibraryEntry(
             id = id,

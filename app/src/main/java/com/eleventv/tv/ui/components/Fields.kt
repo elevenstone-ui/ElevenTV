@@ -304,7 +304,13 @@ fun SubtitlePreview(
 
 /** 只读信息行（版本号、路径之类） */
 @Composable
-fun InfoRow(label: String, value: String, modifier: Modifier = Modifier) {
+fun InfoRow(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    /** 默认 2 行是给「版本号 / 路径」这类短信息留的；条款声明类文本应传 Int.MAX_VALUE */
+    valueMaxLines: Int = 2,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier
@@ -312,7 +318,7 @@ fun InfoRow(label: String, value: String, modifier: Modifier = Modifier) {
             .padding(horizontal = D.Lg, vertical = D.Sm),
     ) {
         TvText(label, style = T.Body2, color = C.Text2, modifier = Modifier.width(160.dp), maxLines = 1)
-        TvText(value, style = T.Body2, color = C.Text1, modifier = Modifier.weight(1f), maxLines = 2)
+        TvText(value, style = T.Body2, color = C.Text1, modifier = Modifier.weight(1f), maxLines = valueMaxLines)
     }
 }
 

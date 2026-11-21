@@ -76,6 +76,7 @@ class LocalRepository(
     private val _playback = MutableStateFlow<List<PlaybackRecord>>(emptyList())
     private val _scanJob = MutableStateFlow(JobState())
     private val _scrapeJob = MutableStateFlow(JobState())
+    private val _scrapeFailures = MutableStateFlow<Map<String, String>>(emptyMap())
     private val _ready = MutableStateFlow(false)
 
     override val servers: StateFlow<List<SmbServer>> = _servers.asStateFlow()
@@ -84,6 +85,7 @@ class LocalRepository(
     override val playback: StateFlow<List<PlaybackRecord>> = _playback.asStateFlow()
     override val scanJob: StateFlow<JobState> = _scanJob.asStateFlow()
     override val scrapeJob: StateFlow<JobState> = _scrapeJob.asStateFlow()
+    override val scrapeFailures: StateFlow<Map<String, String>> = _scrapeFailures.asStateFlow()
     override val ready: StateFlow<Boolean> = _ready.asStateFlow()
 
     private val scanMutex = Mutex()
@@ -94,14 +96,32 @@ class LocalRepository(
     private val libraryGate = SaveGate()
     private val playbackGate = SaveGate()
 
+    /**
+     * Keystore 被重置、密文解不开的服务器 id。
+     *
+     * 这些条目在内存里保留原始密文，落盘时也原样写回，直到用户重新填写密码。
+     * 否则「解密失败 → 空串 → seal 跳过空串 → 明文落盘」会把原密文永久覆盖。
+     */
+    private val passwordNeedsRefill =
+        java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
     /** 只保护「取快照 + 领版本号」这一步，不参与 IO */
     private val saveLock = Any()
 
     override suspend fun init() {
         withContext(Dispatchers.IO) {
-            // 落盘时加密了 SMB 密码（见 SecretBox）；内存里保持明文，连接时要用
-            _servers.value = serverStore.read(serversSerializer, emptyList())
-                .map { it.copy(password = SecretBox.open(it.password)) }
+            // 落盘时加密了 SMB 密码（见 SecretBox）；内存里保持明文，连接时要用。
+            // 解不开的条目保留原始密文并登记，避免被空串回写覆盖（见 BUG-07）。
+            _servers.value = serverStore.read(serversSerializer, emptyList()).map { stored ->
+                val plain = SecretBox.tryOpen(stored.password)
+                if (plain == null) {
+                    passwordNeedsRefill += stored.id
+                    Log.w(TAG, "服务器「${stored.name}」的密码解不开（Keystore 可能被重置），保留原密文待重填")
+                    stored
+                } else {
+                    stored.copy(password = plain)
+                }
+            }
             _settings.value = settingsStore.read(AppSettings.serializer(), defaultSettings())
             _library.value = LibrarySnapshot(libraryStore.read(entriesSerializer, emptyList()))
             _playback.value = playbackStore.read(playbackSerializer, emptyList())
@@ -133,7 +153,10 @@ class LocalRepository(
     private fun persistServers() {
         serverStore.write(
             serversSerializer,
-            _servers.value.map { it.copy(password = SecretBox.seal(it.password)) },
+            _servers.value.map { srv ->
+                // 待重填的条目内存里仍是原始密文，原样写回，不做二次 seal、也不写空串
+                if (srv.id in passwordNeedsRefill) srv else srv.copy(password = SecretBox.seal(srv.password))
+            },
         )
     }
 
@@ -220,12 +243,18 @@ class LocalRepository(
     override suspend fun saveServer(server: SmbServer) = withContext(Dispatchers.IO) {
         val list = _servers.value.filterNot { it.id == server.id } + server
         _servers.value = list.sortedBy { it.name }
+        // 用户重新保存过该服务器（通常就是来重填密码的），原密文可以安全替换
+        passwordNeedsRefill -= server.id
         persistServers()
         // 连接参数可能变了，旧连接作废
         pool.invalidate(server.id)
     }
 
     override suspend fun deleteServer(id: String) = withContext(Dispatchers.IO) {
+        // 下面会不可逆地裁剪媒体库与播放记录，先各留一份备份（与 scan() 一致）
+        libraryStore.backup()
+        playbackStore.backup()
+        passwordNeedsRefill -= id
         _servers.value = _servers.value.filterNot { it.id == id }
         persistServers()
 
@@ -294,6 +323,8 @@ class LocalRepository(
             // 而 id 依赖归并结果（季数、命名写法一变，历史实现算出的 id 就会漂移）
             val previousByFile = HashMap<String, LibraryEntry>()
             for (old in previous) for (f in old.files) previousByFile[f.id] = old
+            // 按 id 建索引：下面每个新条目都要回查旧条目，线性扫整库是 O(F×P)
+            val previousById = previous.associateBy { it.id }
 
             val result = Scanner(pool).scan(servers, _settings.value) { p ->
                 _scanJob.value = JobState(
@@ -310,7 +341,7 @@ class LocalRepository(
                 val oldId = entry.files.mapNotNull { previousByFile[it.id] }
                     .groupingBy { it.id }.eachCount()
                     .maxByOrNull { it.value }?.key
-                entry.inheritScrape(oldId?.let { id -> previous.firstOrNull { it.id == id } })
+                entry.inheritScrape(oldId?.let { previousById[it] })
             }
 
             // 到这里为止，「整库重建」还是不可逆的：下面一写盘，上一份媒体库（含全部
@@ -320,13 +351,20 @@ class LocalRepository(
             //    NAS 没连上 / 共享名填错 / 权限变了的时候，扫描会「成功」地返回 0 条，
             //    于是在启动瞬间把用户攒了几百部的库覆盖成空——重启一次库就空了，
             //    正是这个原因。读不到东西该报错，不该当成「用户把片子删光了」。
-            if (fresh.isEmpty() && previous.isNotEmpty()) {
+            // 首次扫描（previous 为空）时也必须拦住：NAS 临时不可达会把库写成空的，
+            // 界面却显示「扫描完成：0 部」，用户分不清是失败还是真的没片子。
+            if (fresh.isEmpty()) {
                 _scanJob.value = JobState(
                     status = JobStatus.Failed,
                     error = buildString {
                         append("这次扫描一个视频都没读到")
                         if (result.failedDirs > 0) append("（${result.failedDirs} 个目录读取失败）")
-                        append("，已保留上一次的媒体库。请确认 NAS 在线、共享名与媒体库根目录是否正确。")
+                        if (previous.isNotEmpty()) {
+                            append("，已保留上一次的媒体库")
+                        } else {
+                            append("，媒体库保持为空（暂无可保留的旧数据）")
+                        }
+                        append("。请确认 NAS 在线、共享名与媒体库根目录是否正确。")
                     },
                 )
                 return
@@ -337,8 +375,10 @@ class LocalRepository(
             //    而前者是可恢复的、后者下次干净扫描就能收敛——所以宁可多留一次。
             val entries = if (result.failedDirs > 0) {
                 val seen = fresh.flatMapTo(HashSet()) { e -> e.files.map { it.id } }
+                // fresh.none { it.id == old.id } 是 O(F×P)，换成一次建索引的 O(1) 查找
+                val freshIds = fresh.mapTo(HashSet()) { it.id }
                 val kept = previous.filter { old ->
-                    fresh.none { it.id == old.id } && old.files.none { it.id in seen }
+                    old.id !in freshIds && old.files.none { it.id in seen }
                 }
                 if (kept.isNotEmpty()) {
                     Log.w(TAG, "${result.failedDirs} 个目录读取失败，保留 ${kept.size} 条上次扫描的条目")
@@ -369,7 +409,10 @@ class LocalRepository(
                 scrapeAll(force = false)
             }
         } catch (e: CancellationException) {
-            _scanJob.value = JobState(JobStatus.Failed, error = "扫描已取消")
+            // 用户点「停止扫描」触发的取消不是失败：置 Idle 而不是 Failed，
+            // 否则首页空库分支会把「扫描失败」四个字甩给用户，像出了故障。
+            // 这里也不写盘（取消发生在 backup/saveLibrary 之前），媒体库保持不变。
+            _scanJob.value = JobState(JobStatus.Idle, message = "扫描已停止")
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "扫描失败", e)
@@ -384,6 +427,18 @@ class LocalRepository(
     override suspend fun scrapeAll(force: Boolean) {
         if (!scrapeMutex.tryLock()) return
         try {
+            // 每轮开始先清掉上一轮的原因，避免清单里混着已经刮成功的旧条目
+            _scrapeFailures.value = emptyMap()
+            // 前置自检：源码包不再内置 TMDB 凭证，没填 Key 时 tmdbGet 连请求都不发，
+            // 整库空跑一遍只会报「检查网络」。这里直接给出可行动的提示。
+            if (!TmdbSource.hasCredentials(_settings.value)) {
+                _scrapeJob.value = JobState(
+                    JobStatus.Failed,
+                    error = "未配置 TMDB API Key：请到「设置 → 刮削」填写 TMDB API Key 或读访问令牌",
+                )
+                return
+            }
+
             val targets = _library.value.entries.filter { force || !it.scraped }
             if (targets.isEmpty()) {
                 _scrapeJob.value = JobState(JobStatus.Done, "全部条目已刮削")
@@ -414,9 +469,9 @@ class LocalRepository(
                                 current = n,
                                 total = targets.size,
                             )
-                            // 每 5 条落一次库：既让 UI 增量看到海报，
-                            // 又避免每条都写一遍几百 KB 的 JSON
-                            if (n % 5 == 0) mergeAndSave(merged)
+                            // 批量落盘：整库 JSON 序列化 + fsync 很贵，5 条一次过密。
+                            // 结束时还有一次 mergeAndSave 兜底，不会丢最后不足一批的结果。
+                            if (n % SAVE_BATCH == 0) mergeAndSave(merged)
                         }
                     }
                 }.awaitAll()
@@ -426,27 +481,37 @@ class LocalRepository(
             // 只有 applyResult 会刷新 scrapedAt，而它只在「真的拿到了元数据」时被调用；
             // 所有失败路径都原样返回 entry，时间戳保持上一轮的值
             val success = merged.values.count { it.scrapedAt >= startedAt }
+            // 失败原因一律从「每条自己的 failures」聚合，不再读 TmdbSource.lastError()。
+            // 后者是 3 个并发协程共享的字段，任意一次 2xx 都会把它清成 null，
+            // 于是全军覆没时只剩「检查网络」这种没有指向的兜底话术。
+            val reasons = targets.mapNotNull { scraper.failures[it.id] }
+            // 逐条原因留给「未命中清单」显示：汇总只报 top 类别，看不出 429 /
+            // 详情失败 / 搜不到 各自占多少，排障时一直靠猜
+            _scrapeFailures.value = scraper.failures.toMap()
+            // 真实失败数 = 目标数 − 成功数。不能用 top.value 当失败数：
+            // reason 里带着片名（「TMDB 搜不到「xxx」」），每部片自成一组，
+            // top.value 恒为 1 —— 209 条失败会被显示成「未命中 1 条」。
+            val failed = (targets.size - success).coerceAtLeast(0)
+            // 按「原因类别」分组，把片名等动态部分抹掉，才能统计出最主要的那类问题
+            val top = reasons.groupingBy { reasonCategory(it) }.eachCount()
+                .maxByOrNull { it.value }
             _scrapeJob.value = if (success == 0) {
-                // 全军覆没时把 TMDB 记录的具体原因带上（连不上 / 401 / 429），
-                // 「去设置里跑网络诊断」给用户一个明确的下一步
-                val reason = TmdbSource.lastError()
                 JobState(
                     JobStatus.Failed,
                     error = "没有条目刮削成功" + when {
-                        reason != null -> "：$reason（可到设置 → 刮削 → 网络诊断进一步确认）"
-                        else -> "：检查网络，或到设置 → 刮削 → 网络诊断进一步确认"
+                        top != null -> "：$failed 条失败，主要因为「${top.key}」（可到设置 → 刮削 → 网络诊断进一步确认）"
+                        else -> "：$failed 条失败（可到设置 → 刮削 → 网络诊断进一步确认）"
                     },
                 )
             } else {
-                // 部分失败时把最常见的原因带上：用户能据此判断是网络、还是文件名太离谱
-                val reasons = targets.mapNotNull { scraper.failures[it.id] }
-                val top = reasons.groupingBy { it.substringBefore('（') }.eachCount()
-                    .maxByOrNull { it.value }
                 JobState(
                     JobStatus.Done,
                     message = buildString {
                         append("刮削完成：成功 $success / ${targets.size}")
-                        if (top != null) append("；未命中 ${top.value} 条，主要因为「${top.key}」")
+                        if (failed > 0) {
+                            append("；失败 $failed 条")
+                            if (top != null) append("，主要因为「${top.key}」")
+                        }
                     },
                 )
             }
@@ -463,7 +528,15 @@ class LocalRepository(
 
     override suspend fun scrapeOne(entryId: String) = withContext(Dispatchers.IO) {
         val entry = _library.value.entries.firstOrNull { it.id == entryId } ?: return@withContext
-        val result = runCatching { Scraper(_settings.value).scrape(entry) }.getOrElse { entry }
+        val scraper = Scraper(_settings.value)
+        val result = runCatching { scraper.scrape(entry) }.getOrElse { entry }
+        // 单条重刮也要同步清单里的原因：成功了就抹掉，失败了换成新的
+        _scrapeFailures.update { old ->
+            val next = old.toMutableMap()
+            val reason = scraper.failures[entryId]
+            if (reason == null) next.remove(entryId) else next[entryId] = reason
+            next
+        }
         val merged = ConcurrentHashMap<String, LibraryEntry>().apply { put(entryId, result) }
         mergeAndSave(merged)
     }
@@ -483,6 +556,7 @@ class LocalRepository(
         }
         _library.value = LibrarySnapshot(cleared)
         saveLibrary()
+        _scrapeFailures.value = emptyMap()
         _scrapeJob.value = JobState(JobStatus.Idle, "已清除刮削结果")
     }
 
@@ -495,6 +569,21 @@ class LocalRepository(
             )
         }
         saveLibrary()
+    }
+
+    /**
+     * 把带片名的失败原因归成类别，供任务栏聚合。
+     *
+     * 「TMDB 搜不到「Resident Evil 2026 AMZN KyoGo」」每部片都不一样，
+     * 直接按整串分组，209 条失败会散成 209 组、top.value=1，
+     * 用户看到「未命中 1 条」根本不知道有 208 条也挂了。
+     */
+    private fun reasonCategory(reason: String): String = when {
+        reason.startsWith("网络/凭证问题") -> "网络/凭证问题"
+        reason.startsWith("TMDB 搜不到") -> "TMDB 搜不到（片名/命名问题）"
+        reason.startsWith("详情拉取失败") -> "TMDB 详情拉取失败"
+        reason.startsWith("TMDB 命中") -> "TMDB 命中但无海报或评分"
+        else -> reason.substringBefore('（').substringBefore('「').trim()
     }
 
     /**
@@ -622,13 +711,20 @@ class LocalRepository(
         }
 
         // 五个类型行，空则隐藏。
-        // 归类用 effectiveKind：刮削到的类型标签（动漫/纪录片/综艺）优先于扫描时按目录猜的类型
+        // 归类用 effectiveKind：刮削到的类型标签（动漫/纪录片/综艺）优先于扫描时按目录猜的类型。
+        // 原本每个类型各跑一次「全表 filter + 全表排序」，共 5 次 O(n log n)；
+        // 改为一次遍历分桶，再只对各桶排序。结果顺序、截取条数与原来完全一致。
+        val byKind = HashMap<MediaKind, MutableList<LibraryEntry>>()
+        for (e in entries) {
+            if (e.effectiveKind !in HOME_KINDS) continue
+            byKind.getOrPut(e.effectiveKind) { ArrayList() } += e
+        }
         for (kind in HOME_KINDS) {
-            val items = entries
-                .filter { it.effectiveKind == kind }
-                .sortedByDescending { it.addedAt }
-                .take(16)
-                .map { it.toSummary(records[it.id]) }
+            val items = byKind[kind]
+                ?.sortedByDescending { it.addedAt }
+                ?.take(16)
+                ?.map { it.toSummary(records[it.id]) }
+                .orEmpty()
             if (items.isNotEmpty()) {
                 rows += Row(
                     id = kind.name.lowercase(),
@@ -681,11 +777,15 @@ class LocalRepository(
     }
 
     override fun saveProgress(entryId: String, file: MediaFile, positionMs: Long, durationMs: Long) {
-        if (durationMs <= 0L || positionMs < 0L) return
+        // durationMs 允许为 0：TS / m2ts / 部分 ISO 没有容器时长，此时仍要保存位置，
+        // 否则续播与「继续播放」行对这类片源完全失效。
+        // PlaybackRecord.progress / finished 已按 duration<=0 兜底为 0 / false。
+        if (positionMs <= 0L) return
         val record = PlaybackRecord(
             entryId = entryId,
             fileId = file.id,
-            positionMs = positionMs.coerceAtMost(durationMs),
+            // 时长为 0 时不能 coerceAtMost(0)，那会把位置压成 0
+            positionMs = if (durationMs > 0L) positionMs.coerceAtMost(durationMs) else positionMs,
             durationMs = durationMs,
             updatedAt = System.currentTimeMillis(),
         )
@@ -734,6 +834,8 @@ class LocalRepository(
     private companion object {
         const val TAG = "ElevenTV"
         const val MAX_SCRAPE_CONCURRENCY = 3
+        /** 刮削期间批量落盘间隔（条）；结束时另有一次无条件兜底写 */
+        const val SAVE_BATCH = 20
         const val ROW_CONTINUE = "continue"
 
         val HOME_KINDS = listOf(

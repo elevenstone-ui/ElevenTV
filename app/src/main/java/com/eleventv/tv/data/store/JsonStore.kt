@@ -84,7 +84,18 @@ class JsonStore(private val file: File) {
             return null
         }
         Log.w(TAG, "${file.name} 已从 ${bak.name} 恢复")
-        runCatching { bak.copyTo(file, overwrite = true) }
+        // 回写必须走 write()：只有它带 tmp + fd.sync() + ATOMIC_MOVE。
+        // 原来的 bak.copyTo(file) 是普通覆盖，而此刻 quarantine 已经把损坏的主文件挪走，
+        // 磁盘上唯一的新主文件就是这个非原子写入 —— 恢复过程中再断一次电就得到半截 JSON，
+        // 下次启动又要重走一遍损坏流程。
+        // read() 与 write() 持有同一把可重入锁，这里直接调用不会死锁。
+        @Suppress("UNCHECKED_CAST")
+        val serializer = deserializer as? SerializationStrategy<T>
+        if (serializer == null) {
+            Log.w(TAG, "${file.name} 的反序列化器不支持序列化，跳过原子回写")
+        } else if (!write(serializer, value)) {
+            Log.w(TAG, "${file.name} 回写失败，下次启动仍会走恢复流程")
+        }
         return value
     }
 

@@ -13,6 +13,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Dns
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.InetAddress
@@ -40,6 +41,27 @@ import java.util.concurrent.TimeUnit
 object Http {
 
     private val dohHosts = setOf("api.tmdb.org", "api.themoviedb.org", "image.tmdb.org")
+
+    /** TMDB 官方图片前缀，重写时按它识别 */
+    private const val IMAGE_PREFIX = "https://image.tmdb.org/t/p"
+
+    /** 与 DoubanSource.headers 一致：豆瓣图片 CDN 对裸请求返回 418 */
+    private const val BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+    /**
+     * 图片 CDN 反代前缀，由 [com.eleventv.tv.ElevenApp] 在设置变化时同步。
+     *
+     * 放在网络层而不是「拼 URL 时替换」：媒体库里已经存了几百个完整的
+     * image.tmdb.org URL（海报/背景/演员头像/季海报/剧照），在生成处替换
+     * 意味着用户必须全库重刮才能生效。拦截器对所有请求统一重写，
+     * 老数据、Coil 异步加载、诊断探测全部覆盖，清空设置即可回滚。
+     */
+    @Volatile
+    var imageBaseUrl: String = ""
+        set(value) {
+            field = value.trim().trimEnd('/')
+        }
 
     /** 与 1.7.6 完全一致的端点列表：注意 doh.pub 用 /resolve（JSON API 路径）。 */
     private val dohEndpoints = listOf(
@@ -81,7 +103,9 @@ object Http {
     /** 判断某 IP 是否落在已知伪造段内。 */
     private fun isPoisoned(ip: InetAddress): Boolean {
         val bytes = ip.address
-        if (bytes.size != 4) return false // IPv6 不在投毒池内
+        // 投毒样本目前只有 IPv4 段；IPv6 应答一律放行。
+        // 这不是「IPv6 一定干净」，而是没有可核验的实测样本前不做猜测。
+        if (bytes.size != 4) return false
         for ((base, prefix, _) in poisonRanges) {
             var fullMatch = true
             val bits = prefix
@@ -120,6 +144,37 @@ object Http {
     private fun buildClient(): OkHttpClient =
         OkHttpClient.Builder()
             .dns(DohDns)
+            // 图片层统一处理：见 [imageBaseUrl]。必须挂在网络拦截器之前的
+            // 应用拦截器里，才能同时覆盖 Coil 的异步图片请求与诊断探测。
+            .addInterceptor(Interceptor { chain ->
+                val original = chain.request()
+                val url = original.url.toString()
+                var req = original
+
+                // 豆瓣图片 CDN 会拦裸请求（418）：OkHttp 默认 UA 不是浏览器，
+                // 也不带 Referer。补上这两个头，豆瓣海报才显示得出来。
+                if (original.url.host.endsWith("doubanio.com")) {
+                    req = req.newBuilder()
+                        .header("User-Agent", BROWSER_UA)
+                        .header("Referer", "https://movie.douban.com/")
+                        .build()
+                }
+
+                // TMDB 图片 CDN 反代：SNI 阻断时换前缀，已入库的旧 URL 也生效。
+                val base = imageBaseUrl
+                if (base.isNotBlank() && url.startsWith(IMAGE_PREFIX)) {
+                    req = runCatching {
+                        req.newBuilder()
+                            .url(base + url.removePrefix(IMAGE_PREFIX))
+                            .build()
+                    }.getOrElse {
+                        // 前缀填错了也不能让整张图挂掉：退回原始请求
+                        Log.w(TAG, "图片反代前缀无效，使用官方直连：$base")
+                        req
+                    }
+                }
+                chain.proceed(req)
+            })
             // DoH 首次解析 + TLS + 弱网下 8s 连接超时经常不够
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
@@ -215,6 +270,9 @@ object Http {
             val host = hostname.lowercase()
             if (host !in dohHosts) return Dns.SYSTEM.lookup(hostname)
 
+            // 缓存命中优先于熔断是刻意的：只要手里还有一份刚验证过的干净应答，
+            // 就该继续用它，不该因为「上一次查询失败」把有效结果也丢掉。
+            // 熔断只拦「发起新的 DoH 查询」这一步。
             cache[host]?.let { (addresses, expireAt) ->
                 if (System.currentTimeMillis() < expireAt) return addresses
             }

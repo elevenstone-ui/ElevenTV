@@ -29,6 +29,13 @@ interface ElevenRepository {
     val scrapeJob: StateFlow<JobState>
 
     /**
+     * 上一轮刮削里每条失败的「人话原因」（entryId → 原因），成功条目不在表里。
+     * 只存在内存、不落盘：给设置页「未命中清单」逐条显示，避免只报一个 top 原因
+     * 时把 429、详情失败、搜不到混在一起看不出分布。
+     */
+    val scrapeFailures: StateFlow<Map<String, String>>
+
+    /**
      * 本地配置是否已载入完成。
      *
      * 启动时 servers 一开始是空列表，如果不区分「尚未载入」与「确实没服务器」，

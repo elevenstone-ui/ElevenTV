@@ -40,20 +40,28 @@ import androidx.compose.ui.graphics.graphicsLayer
  *
  * @param onClick 传 null 表示这个元素只接收焦点、不响应 OK（少用）
  * @param scale 焦点时放大倍数，1f 表示不缩放
+ * @param highlighted 外部状态直接点亮焦点环，**不走 Compose 焦点**。
+ *   用于按键由 Activity 分发、遥控器方向键根本到不了 Compose 焦点系统的页面
+ *   （典型：播放器错误页的「重试/退出」）——焦点视觉仍由这里统一画，调用方只传个布尔。
+ *   默认 false，其它走正常 Compose 焦点的路径行为不变。
  */
 fun Modifier.focusRing(
     onClick: (() -> Unit)? = null,
     scale: Float = 1f,
     shape: Shape = RoundedCornerShape(D.RadiusPoster),
     enabled: Boolean = true,
+    highlighted: Boolean = false,
 ): Modifier = composed {
     var focused by remember { mutableStateOf(false) }
     val interaction = remember { MutableInteractionSource() }
 
+    // Compose 焦点点亮，或被外部 highlighted 直接点亮，二者取一；enabled 关掉时都不亮
+    val showFocus = (focused || highlighted) && enabled
+
     val currentScale by animateFloatAsState(
-        targetValue = if (focused && enabled) scale else 1f,
+        targetValue = if (showFocus) scale else 1f,
         animationSpec = tween(
-            durationMillis = if (focused) M.FOCUS_IN else M.FOCUS_OUT,
+            durationMillis = if (showFocus) M.FOCUS_IN else M.FOCUS_OUT,
             easing = M.Standard,
         ),
         label = "focusScale",
@@ -79,7 +87,7 @@ fun Modifier.focusRing(
         }
         .drawWithContent {
             drawContent()
-            if (!focused) return@drawWithContent
+            if (!showFocus) return@drawWithContent
             drawFocusVisuals(shape)
         }
 }

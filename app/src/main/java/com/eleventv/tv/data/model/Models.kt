@@ -402,6 +402,19 @@ data class LibraryEntry(
     val seasonPosters: Map<Int, String> = emptyMap(),
     val scrapedAt: Long = 0L,
     val scrapeSource: String? = null,
+    /**
+     * 全剧总集数（TMDB 的 number_of_episodes / 豆瓣的 episodes_count），剧集才有。
+     * null 表示尚未刮削到或该数据源不提供；详情页据此显示「共 N 集 · 库里 M 集」。
+     * 带默认值：旧版 library.json 反序列化时自动取 null，不影响 stableId / 播放记录。
+     */
+    val totalEpisodes: Int? = null,
+    /**
+     * 每季总集数（seasonNumber → 该季集数），来自 TMDB 季详情的 episodes 数组长度。
+     * 多季剧集详情页按季显示「第 N 季 · 共 X 集 · 库里 Y 集」用。
+     * 豆瓣源不提供；拿不到的季不出现在表里，UI 侧对该季只显示库里集数。
+     * 带默认值：旧库反序列化取空表，不影响 stableId / 播放记录。
+     */
+    val seasonEpisodeCounts: Map<Int, Int> = emptyMap(),
 ) {
     val displayTitle: String get() = title ?: rawTitle
 
@@ -468,6 +481,21 @@ data class AppSettings(
     val tmdbApiKey: String = "",
     val tmdbReadToken: String = "",
     val fanartApiKey: String = "",
+    /**
+     * 图片 CDN 反代前缀。空 = 直连官方 `https://image.tmdb.org/t/p`。
+     *
+     * 国内部分网络对 image.tmdb.org 做 SNI 阻断（DNS 解析正常但 TLS 握手被掐），
+     * 海报/背景图/演员头像/剧照会整片加载不出来。填一个可达的反代前缀即可全局替换，
+     * 已入库的旧 URL 也在网络层被重写，不需要重刮。
+     * 例如自建反代 `https://tmdb.example.com/t/p`，
+     * 或公共图片服务 `https://wsrv.nl/?url=image.tmdb.org/t/p`。
+     */
+    val imageBaseUrl: String = "",
+    /**
+     * 豆瓣海报优先。豆瓣图片 CDN（img*.doubanio.com）在国内可达，
+     * 能在 TMDB 海报 CDN 被阻断时让中文片立刻出图；关掉则用回 TMDB 高清海报。
+     */
+    val preferDoubanPoster: Boolean = true,
     val scrapePoster: Boolean = true,
     val scrapeBackdrop: Boolean = true,
     val scrapeSeasonOverview: Boolean = true,

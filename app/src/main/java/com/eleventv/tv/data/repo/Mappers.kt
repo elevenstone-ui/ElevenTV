@@ -87,6 +87,16 @@ private fun LibraryEntry.badgeList(): List<PosterBadge> = buildList {
 private val DYNAMIC_PRIORITY = listOf("DV", "HDR10+", "HDR10", "HDR")
 
 /**
+ * 纯集号角标（不含单集标题）：单季 `E3`，多季 `S2E3`。
+ *
+ * 播放页顶栏第一行已经把单集标题并排在剧名后面，第二行再走 [episodeLabel]
+ * 会带出「E3 · 单集标题」，单集标题显示两遍。第二行只保留集号即可。
+ * 集号格式与 [episodeLabel] 完全一致（`S${seasonNumber}E${episodeNumber}` 紧凑）。
+ */
+fun MediaFile.episodeNumberLabel(): String =
+    if (seasonNumber > 1) "S${seasonNumber}E$episodeNumber" else "E$episodeNumber"
+
+/**
  * 单集 → 选集卡片标题。
  *
  * 电影必须传 `isMovie = true`：`MediaFile` 的季/集号默认是 1，不传就会给电影

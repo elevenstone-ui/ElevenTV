@@ -35,6 +35,10 @@ data class ScrapeResult(
     val seasonPosters: Map<Int, String> = emptyMap(),
     /** "季-集" → 单集信息 */
     val episodes: Map<String, EpisodeScrape> = emptyMap(),
+    /** 全剧总集数（TMDB 的 number_of_episodes，剧集才有）；null = 该源没给出，UI 只显示库里集数 */
+    val totalEpisodes: Int? = null,
+    /** 每季总集数（seasonNumber → 该季 episodes 数组长度）；多季剧按季显示集数用 */
+    val seasonEpisodeCounts: Map<Int, Int> = emptyMap(),
     val source: String = "",
 )
 
@@ -43,6 +47,19 @@ data class EpisodeScrape(
     val overview: String? = null,
     val stillUrl: String? = null,
     val rating: Double? = null,
+)
+
+/**
+ * 一次 TMDB 搜索的结果：必须把「一条都没搜到」和「请求本身失败」分开。
+ *
+ * 以前两者都返回 emptyList，上层只能读全局 lastErrorText 区分，而那是 3 个并发
+ * 协程共享的字段，任意一次 2xx 都会把它清空 —— 401/429/连不上被误报成「检查网络」，
+ * 整库刮削失败时用户看不出到底该换 Key、等限流还是查网络。
+ */
+data class SearchOutcome(
+    val hits: List<ScrapeHit>,
+    val requestFailed: Boolean,
+    val error: String?,
 )
 
 /** 搜索命中的候选 */
@@ -92,6 +109,16 @@ object TmdbSource {
 
     fun lastError(): String? = lastErrorText
 
+    /**
+     * 是否至少有一把可用凭证。
+     *
+     * 源码里已不再内置备用 Key（外发源码包等于把凭证一起发出去），只能由
+     * local.properties 注入或用户在设置页填写。没凭证时 tmdbGet 连请求都不发，
+     * 整库刮削会白跑一遍再报「检查网络」——用户根本看不出真正该做什么。
+     * 批量开始前用它做一次前置自检，直接给出可行动的提示。
+     */
+    fun hasCredentials(settings: AppSettings): Boolean = creds(settings).isNotEmpty()
+
     private fun isJwt(token: String): Boolean {
         val parts = token.split('.')
         if (parts.size != 3 || parts.any { it.isEmpty() }) return false
@@ -125,11 +152,25 @@ object TmdbSource {
      */
     private val blockedUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
+    /**
+     * 连续 429 的退避状态。
+     *
+     * 429 有两种：每分钟的短限流（等 60s 就好）和免费 Key 的当日配额耗尽
+     * （当天再怎么等都没用）。响应头没透传出来，没法可靠区分，所以不猜类型，
+     * 只做指数退避：连续 429 退避 60s → 2min → 8min → 30min 封顶；
+     * 冷却期内所有请求直接短路、不再发网络请求，避免 3 个并发协程整晚对着 429 空转。
+     * 任意一次 2xx 立即把计数归零，短限流因此能自动恢复。
+     */
+    private val consecutive429 = java.util.concurrent.atomic.AtomicInteger(0)
+    private val rateLimitUntil = java.util.concurrent.atomic.AtomicLong(0L)
+
     private fun creds(settings: AppSettings): List<Cred> {
         val list = mutableListOf<Cred>()
-        val token = settings.tmdbReadToken.ifBlank { BuildConfig.TMDB_READ_TOKEN }
+        // trim() 不能省：从网页复制粘贴 Key 常带首尾空格或换行，不去掉就是
+        // "&api_key= abc" → 稳定 401，而设置页仍然显示「已配置」，极难自查。
+        val token = settings.tmdbReadToken.trim().ifBlank { BuildConfig.TMDB_READ_TOKEN.trim() }
         if (token.isNotBlank() && isJwt(token)) list += Cred(token, bearer = true)
-        val key = settings.tmdbApiKey.ifBlank { BuildConfig.TMDB_API_KEY }
+        val key = settings.tmdbApiKey.trim().ifBlank { BuildConfig.TMDB_API_KEY.trim() }
         if (key.isNotBlank()) list += Cred(key, bearer = false)
         return list.distinctBy { it.value }
     }
@@ -158,6 +199,14 @@ object TmdbSource {
             return null
         }
 
+        // 连续 429 的退避窗口内直接短路：不发请求，也不消耗配额。
+        val until = rateLimitUntil.get()
+        if (System.currentTimeMillis() < until) {
+            val waitMin = ((until - System.currentTimeMillis()) / 60_000L).coerceAtLeast(1)
+            lastErrorText = "TMDB 请求过于频繁（HTTP 429），已退避，约 $waitMin 分钟后自动重试"
+            return null
+        }
+
         var lastReason: String? = null
 
         for (base in BASES) {
@@ -180,12 +229,17 @@ object TmdbSource {
                 val (code, body) = Http.getWithStatus(url, headers)
                 when {
                     code in 200..299 -> {
-                        lastErrorText = null
+                        // 拿到一次正常响应就说明凭证可用、也没被限流，退避立即归零
+                        consecutive429.set(0)
+                        rateLimitUntil.set(0L)
                         val parsed = body?.let {
                             runCatching { Http.json.parseToJsonElement(it) }.getOrNull()
                         }
                         return parsed?.obj() ?: run {
-                            lastReason = "TMDB 返回了无法解析的内容"
+                            // 2xx 但 body 不是 JSON 对象（空响应、被劫持的 HTML 等）也是失败。
+                            // 以前只写局部变量 lastReason，直接 return 绕过了末尾的赋值，
+                            // 于是失败原因永远为 null，整库刮削只报「检查网络」。
+                            lastErrorText = "TMDB 返回了无法解析的内容（HTTP $code）"
                             null
                         }
                     }
@@ -196,8 +250,14 @@ object TmdbSource {
                     }
 
                     code == 429 -> {
-                        blockedUntil[cred.value] = System.currentTimeMillis() + RATE_LIMIT_COOLDOWN_MS
-                        lastReason = "TMDB 请求过于频繁（HTTP 429），已切换备用凭证"
+                        // 指数退避：60s → 2min → 8min → 30min 封顶。不猜是短限流还是
+                        // 日配额耗尽，成功路径的 2xx 会把计数归零，短限流自动恢复。
+                        val n = consecutive429.incrementAndGet().coerceAtMost(4)
+                        val backoff = arrayOf(60_000L, 120_000L, 480_000L, 1_800_000L)[n - 1]
+                        rateLimitUntil.set(System.currentTimeMillis() + backoff)
+                        blockedUntil[cred.value] = System.currentTimeMillis() + backoff
+                        lastReason = "TMDB 请求过于频繁（HTTP 429），已退避，" +
+                            "约 ${backoff / 60_000L} 分钟后自动重试"
                     }
 
                     code == 0 -> {
@@ -243,28 +303,36 @@ object TmdbSource {
      * 现在的顺序：带年份求精确 → 空了去年份重搜 → 还空就换端点（媒体类型判错时）。
      * 换端点的结果必须标题强匹配才采信，否则「三体」会在电影端点命中「我们的身体」。
      */
-    suspend fun search(query: String, year: Int?, kind: MediaKind, settings: AppSettings): List<ScrapeHit> {
+    suspend fun search(query: String, year: Int?, kind: MediaKind, settings: AppSettings): SearchOutcome {
         val wantedMovie = kind == MediaKind.MOVIE
 
         // 1) 带年份精确搜索：命中则最准（电影尤其如此）
         if (year != null) {
-            // 「连不上 / 401 / 429」不是「没搜到」，继续退化只会把同一个超时再等两遍，
-            // 整库刮削能慢到不可用——直接放弃，让上层把真实原因显示出来。
-            // 判据必须是「这次请求本身失败」（searchOnce 返回 null），不能看 lastErrorText：
-            // 那是进程级共享字段，刮削有 3 个并发协程，别的条目一次成功就会把它清空，
-            // 于是这里时灵时不灵，反过来也可能被别的条目的旧错误挡住、白丢一次重搜。
-            val exact = searchOnce(query, year, wantedMovie, settings) ?: return emptyList()
-            if (exact.isNotEmpty()) return exact
+            // 「连不上 / 401 / 429」不是「没搜到」，继续退化只会把同一个超时再等两遍。
+            // 判据用 searchOnce 是否返回 null（= 本次请求本身失败），不再读全局
+            // lastErrorText：那是进程级共享字段，3 个并发协程里别的条目一次成功就把它
+            // 清空，反过来也可能拿别人的旧错误误判。
+            val exact = searchOnce(query, year, wantedMovie, settings)
+                ?: return failed(lastErrorText)
+            if (exact.isNotEmpty()) return SearchOutcome(exact, false, null)
         }
 
         // 2) 去掉年份重搜：这一步救回绝大多数剧集
-        val loose = searchOnce(query, null, wantedMovie, settings) ?: return emptyList()
-        if (loose.isNotEmpty()) return loose
+        val loose = searchOnce(query, null, wantedMovie, settings)
+            ?: return failed(lastErrorText)
+        if (loose.isNotEmpty()) return SearchOutcome(loose, false, null)
 
         // 3) 换端点：电影放进剧集库、剧集被当成电影都属于常见误判
-        return (searchOnce(query, null, !wantedMovie, settings) ?: return emptyList())
-            .filter { it.strongMatch(query) }
+        val swapped = searchOnce(query, null, !wantedMovie, settings)
+            ?: return failed(lastErrorText)
+        return SearchOutcome(swapped.filter { it.strongMatch(query) }, false, null)
     }
+
+    private fun failed(reason: String?): SearchOutcome = SearchOutcome(
+        hits = emptyList(),
+        requestFailed = true,
+        error = reason ?: "TMDB 请求失败（未拿到响应）",
+    )
 
     /** 标题强匹配（忽略空格与标点）：仅用于「换端点」这种高风险兜底。 */
     private fun ScrapeHit.strongMatch(query: String): Boolean {
@@ -359,6 +427,10 @@ object TmdbSource {
                 .firstOrNull()?.let { runCatching { it.toString().toInt() }.getOrNull() },
             tmdbId = hit.id,
             imdbId = o.obj("external_ids")?.str("imdb_id"),
+            // 全剧已播出总集数（TMDB /tv/{id} 的 number_of_episodes）。
+            // 详情页用它给出「共 N 集 · 库里 M 集」，让用户一眼看出缺多少集。
+            // 电影没有这个字段，保持 null。
+            totalEpisodes = if (isTv) o.int("number_of_episodes")?.takeIf { it > 0 } else null,
             source = "TMDB",
         )
 
@@ -370,9 +442,13 @@ object TmdbSource {
             val overviews = LinkedHashMap<Int, String>()
             val posters = LinkedHashMap<Int, String>()
             val episodes = LinkedHashMap<String, EpisodeScrape>()
+            // 每季总集数：季详情的 episodes 数组长度，和季简介/单集共用这一次请求，不额外发请求
+            val seasonCounts = LinkedHashMap<Int, Int>()
 
             for (season in seasons.take(MAX_SEASON_REQUESTS)) {
                 val seasonJson = fetchSeason(hit.id, season, settings) ?: continue
+                val episodeCount = seasonJson.arr("episodes").orEmpty().size
+                if (episodeCount > 0) seasonCounts[season] = episodeCount
                 if (wantSeasonOverview) {
                     seasonJson.str("overview")?.takeIf { it.isNotBlank() }?.let { overviews[season] = it }
                     seasonJson.str("poster_path")?.let { posters[season] = "$IMAGE_BASE/w342$it" }
@@ -394,6 +470,7 @@ object TmdbSource {
                 seasonOverviews = overviews,
                 seasonPosters = posters,
                 episodes = episodes,
+                seasonEpisodeCounts = seasonCounts,
             )
         }
 
@@ -413,8 +490,32 @@ object TmdbSource {
 
     /** 网络诊断用：实发一次 /configuration。成功返回 null，失败返回原因。 */
     suspend fun probe(settings: AppSettings): String? {
+        // 诊断是单发、无并发，先清掉上一次批量刮削残留的旧原因；
+        // 批量路径故意不清空（并发下会把真实失败冲成 null），语义各管各的。
+        lastErrorText = null
         tmdbGet("/configuration", settings = settings) ?: return lastErrorText ?: "请求失败"
         return null
+    }
+
+    /**
+     * 网络诊断用：调用刮削第一步真正执行的 [search]（含三级退化阶梯），
+     * 用固定片名 Inception 实测。
+     *
+     * `/configuration` 探活通过只能说明凭证有效、api.tmdb.org 链路通，
+     * 证明不了 search 能返回条目、也证明不了批量不会 429。这里不另造一个
+     * 近似请求，而是直接跑真实链路的同一个函数（同凭证池、同域名轮换、
+     * 同限流冷却、同年份过滤），结论才和批量刮削等价。
+     *
+     * @return (是否成功拿到命中, 人话结论)
+     */
+    suspend fun probeSearch(settings: AppSettings): Pair<Boolean, String> {
+        lastErrorText = null
+        val outcome = search("Inception", 2010, MediaKind.MOVIE, settings)
+        return when {
+            outcome.requestFailed -> false to (outcome.error ?: "请求失败")
+            outcome.hits.isEmpty() -> false to "请求成功但 0 命中（凭证权限或搜索词问题）"
+            else -> true to "正常（Inception 命中 ${outcome.hits.size} 条）"
+        }
     }
 
     private fun oneDecimal(v: Double): String =
@@ -433,9 +534,6 @@ object TmdbSource {
 
     /** 401 的冷却时长：凭证「看起来」无效往往有时效性（限流、服务端抖动），不该永久封杀 */
     private const val AUTH_COOLDOWN_MS = 30 * 60 * 1000L
-
-    /** 429 的冷却时长 */
-    private const val RATE_LIMIT_COOLDOWN_MS = 60_000L
 
 }
 
@@ -462,13 +560,33 @@ object DoubanSource {
             headers,
         )?.arr() ?: return null
 
-        val best = suggestions.mapNotNull { it.obj() }
-            .firstOrNull { item ->
-                val itemYear = item.str("year")?.toIntOrNull()
-                year == null || itemYear == null || kotlin.math.abs(itemYear - year) <= 1
-            } ?: return null
+        // 年份是「偏好」不是「门槛」。
+        //
+        // 旧实现用 firstOrNull 扫到第一个年份匹配的候选就取，全不匹配则整条放弃：
+        // 电影文件名的年份常是压制年/误读（FilenameParser 取的是「最后一个 19xx/20xx」），
+        // 与豆瓣实际条目差几年时，豆瓣 suggest 明明有正确条目，却被这条门砍成 null，
+        // 中英文电影成片刮不到，剧集（TMDB 主源命中率高、少走豆瓣）独善其身。
+        //
+        // 现在：先找「年份差值最小」的候选（等差值时保留 suggest 原顺序 = 相关度序）；
+        // 没有任何候选带年份、或本身没传年份，就退回 suggest 的第一位。
+        // 宁可用最像的，不整条空着。
+        val candidates = suggestions.mapNotNull { it.obj() }
+        val best = if (year != null) {
+            val minDistance = candidates
+                .mapNotNull { item ->
+                    item.str("year")?.toIntOrNull()?.let { y -> kotlin.math.abs(y - year) }
+                }
+                .minOrNull()
+            if (minDistance != null) {
+                candidates.firstOrNull { item ->
+                    val itemYear = item.str("year")?.toIntOrNull()
+                    itemYear != null && kotlin.math.abs(itemYear - year) == minDistance
+                }
+            } else null
+        } else null
+        val chosen = best ?: candidates.firstOrNull() ?: return null
 
-        val id = best.str("id") ?: return null
+        val id = chosen.str("id") ?: return null
         val abstract = Http.getJson(
             "https://movie.douban.com/j/subject_abstract?subject_id=$id",
             headers,
@@ -477,13 +595,16 @@ object DoubanSource {
         val rating = abstract?.obj("rating")?.dbl("value")?.takeIf { it > 0 }
 
         return ScrapeResult(
-            title = best.str("title"),
-            originalTitle = best.str("sub_title")?.takeIf { it.isNotBlank() },
-            year = best.str("year")?.toIntOrNull(),
+            title = chosen.str("title"),
+            originalTitle = chosen.str("sub_title")?.takeIf { it.isNotBlank() },
+            year = chosen.str("year")?.toIntOrNull(),
             overview = abstract?.str("intro")?.takeIf { it.isNotBlank() },
             rating = rating,
-            posterUrl = best.str("img")?.takeIf { it.startsWith("http") },
+            posterUrl = chosen.str("img")?.takeIf { it.startsWith("http") },
             doubanId = id,
+            // subject_abstract 多数剧集不返回集数；某些条目带 episodes_count，
+            // 有则顺手补上「共 N 集」，没有就让 UI 只显示库里集数。
+            totalEpisodes = abstract?.int("episodes_count")?.takeIf { it > 0 },
             source = "豆瓣",
         )
     }

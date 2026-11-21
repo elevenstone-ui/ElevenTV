@@ -5,7 +5,9 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Test
 
 /**
@@ -46,6 +48,8 @@ class DavHttpTest {
         assertTrue("Authorization 头没发出去", captured.contains("Authorization: Basic eA=="))
         // Content-Length 必须与 body 字节数一致，否则服务端会一直等剩下的字节
         assertTrue("Content-Length 与实际 body 不符", captured.contains("Content-Length: 13"))
+        // 旧实现每请求都发 Connection: close，扫描目录树等于每目录重建 TCP（HTTPS 还要重握手）
+        assertFalse("不应主动关闭连接，否则无法复用", captured.contains("Connection: close"))
     }
 
     @Test
@@ -72,6 +76,53 @@ class DavHttpTest {
 
         assertEquals(204, resp.code)
         assertEquals(0, resp.body.size)
+    }
+
+    /**
+     * 连续两次 PROPFIND 必须复用同一条 TCP 连接。
+     *
+     * 这是「WebDAV 每目录新建连接」优化能否成立的核心断言：假服务器只 accept 一次，
+     * 若第二次请求另开连接，就会卡在没人应答的 backlog 里并最终超时。
+     */
+    @Test
+    fun `连续 PROPFIND 复用同一条 TCP 连接`() {
+        val accepts = AtomicInteger()
+        val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        val port = server.localPort
+        thread(isDaemon = true) {
+            runCatching {
+                server.accept().use { socket ->
+                    accepts.incrementAndGet()
+                    socket.soTimeout = 5_000
+                    val input = socket.getInputStream()
+                    val out = socket.getOutputStream()
+                    repeat(2) {
+                        readHead(input)
+                        // 请求体为空，readHead 读到 \r\n\r\n 即已消费完整个请求
+                        out.write(
+                            "HTTP/1.1 207 Multi-Status\r\nContent-Length: 2\r\n\r\nok"
+                                .toByteArray(Charsets.ISO_8859_1),
+                        )
+                        out.flush()
+                    }
+                }
+            }
+            runCatching { server.close() }
+        }
+
+        repeat(2) {
+            val resp = DavHttp.exchange(
+                url = "http://127.0.0.1:$port/media/",
+                method = "PROPFIND",
+                body = ByteArray(0),
+                headers = emptyMap(),
+                connectTimeoutMs = 2_000,
+                readTimeoutMs = 2_000,
+            )
+            assertEquals(207, resp.code)
+            assertEquals("ok", String(resp.body))
+        }
+        assertEquals("两次请求应复用同一条连接，实际 accept 次数不对", 1, accepts.get())
     }
 
     /** 起一个只应答一次的假 HTTP 服务器，返回端口 */

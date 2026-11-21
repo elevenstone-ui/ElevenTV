@@ -32,6 +32,7 @@ import com.eleventv.tv.ui.screens.DetailScreen
 import com.eleventv.tv.ui.screens.HomeScreen
 import com.eleventv.tv.ui.screens.OnboardingScreen
 import com.eleventv.tv.ui.screens.SettingsScreen
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /** 目的地。TV 应用只有这么几个，不需要引 Navigation-Compose。 */
@@ -91,9 +92,33 @@ fun AppRoot(
     val playback by repo.playback.collectAsState()
     val scanJob by repo.scanJob.collectAsState()
     val scrapeJob by repo.scrapeJob.collectAsState()
+    val scrapeFailures by repo.scrapeFailures.collectAsState()
 
     val scope = rememberCoroutineScope()
     var stack by remember { mutableStateOf<List<Screen>>(emptyList()) }
+
+    /**
+     * 当前扫描协程。所有扫描入口（自动 / 首页 / 设置页）都必须走 [startScan]，
+     * 「停止扫描」才能取消到真正干活的那条协程。
+     *
+     * 以前各处直接 `scope.launch { repo.scan() }`，Job 用完就丢，界面上没有任何
+     * 办法让一次长时间扫描停下来。repo.scan() 内部靠 ensureActive() 响应取消，
+     * 且取消发生在写盘之前（CancellationException 在 backup/saveLibrary 之前抛出），
+     * 所以取消不会写出半个媒体库；finally 里也会解锁 scanMutex，下次能正常再扫。
+     */
+    var scanTask by remember { mutableStateOf<Job?>(null) }
+    fun startScan() {
+        // 用 isCompleted 而不是 isActive：取消后到 catch/finally 解锁 scanMutex 之间
+        // 还有一小段窗口，此时 isActive 已是 false 但协程尚未真正结束。若这时放行，
+        // 新的 repo.scan() 会撞上还没解开的锁、tryLock 直接 return，用户点了没反应。
+        // 保留 Job 引用、等它彻底完成再允许重扫，就没有这个假死窗口。
+        val task = scanTask
+        if (task != null && !task.isCompleted) return
+        scanTask = scope.launch { repo.scan() }
+    }
+    fun stopScan() {
+        scanTask?.cancel()
+    }
 
     /**
      * 从详情页返回时要把焦点还给哪个条目。
@@ -130,7 +155,7 @@ fun AppRoot(
     LaunchedEffect(ready, servers.isNotEmpty()) {
         if (!ready || servers.isEmpty() || autoScanStarted) return@LaunchedEffect
         autoScanStarted = true
-        if (settings.autoScanOnStart) repo.scan()
+        if (settings.autoScanOnStart) startScan()
     }
 
     val current = stack.lastOrNull() ?: return
@@ -257,7 +282,8 @@ fun AppRoot(
                         hasServers = servers.isNotEmpty(),
                         onOpenTitle = { summary -> go(Screen.Detail(summary.id)) },
                         onViewAll = { kind -> go(Screen.Browse(kind)) },
-                        onScan = { scope.launch { repo.scan() } },
+                        onScan = { startScan() },
+                        onStopScan = { stopScan() },
                         onScrape = { scope.launch { repo.scrapeAll() } },
                         onAddServer = { go(Screen.Settings) },
                         focusId = returnFocusId,
@@ -311,10 +337,25 @@ fun AppRoot(
                         scrapeJob = scrapeJob,
                         entryCount = library.entries.size,
                         scrapedCount = library.entries.count { it.scraped },
+                        unmatched = library.entries.filterNot { it.scraped }.map { e ->
+                            // 失败原因放最前、并按它排序：同类原因会连成一片，
+                            // 一眼看出这轮是 429、详情失败还是真搜不到，各占多少。
+                            val dir = e.files.firstOrNull()?.path
+                                ?.substringBeforeLast('/', "")
+                                ?.substringAfterLast('/')
+                                ?.takeIf { it.isNotBlank() } ?: "（根目录/散放）"
+                            "${scrapeFailures[e.id] ?: "（本轮未记录原因）"}  ｜ " +
+                                "${e.rawTitle}  ｜ 目录：$dir  ｜ ${e.kind}"
+                        }.sortedBy { line ->
+                            // 只按「原因类别」排：抹掉片名/具体错误，同类失败才连成一片
+                            line.substringBefore("｜")
+                                .substringBefore("（").substringBefore("「").substringBefore("：")
+                        },
                         onTest = { server -> repo.testServer(server) },
                         onSaveServer = { server -> scope.launch { repo.saveServer(server) } },
                         onDeleteServer = { id -> scope.launch { repo.deleteServer(id) } },
-                        onScan = { scope.launch { repo.scan() } },
+                        onScan = { startScan() },
+                        onStopScan = { stopScan() },
                         onScrapeAll = { force -> scope.launch { repo.scrapeAll(force) } },
                         onClearScraped = { scope.launch { repo.clearScraped() } },
                         onDiagnose = {

@@ -1,15 +1,19 @@
 package com.eleventv.tv.data.scrape
 
 import com.eleventv.tv.data.model.AppSettings
+import com.eleventv.tv.data.model.MediaKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
  * 刮削网络诊断。
  *
- * 「刮削失败」一句提示没法定位问题——DNS、TMDB、海报 CDN、fanart、豆瓣
- * 是五段独立的链路，任何一段断都会表现成同一个样子。这里逐项实测并给出
- * 人话结论，用户跑一遍就知道断在哪、该修什么（换 Key / 等限流过去）。
+ * 「刮削失败」一句提示没法定位问题——DNS、TMDB 探活、TMDB 搜索、
+ * 海报 CDN、豆瓣图片 CDN、豆瓣 API、fanart 是互相独立的链路，任何一段断
+ * 都会表现成同一个样子。这里逐项实测并给出人话结论。
+ *
+ * 尤其不能只靠 `/configuration` 探活就判定「TMDB 正常」：刮削第一步走的是
+ * `/search/movie`，两者凭证池相同但限流/权限/返回结构都可能不同。
  */
 object ScrapeDiagnostics {
 
@@ -32,15 +36,46 @@ object ScrapeDiagnostics {
         val tmdbReason = TmdbSource.probe(settings)
         items += Item("TMDB API", tmdbReason == null, tmdbReason ?: "正常（凭证有效）")
 
-        // 3. 海报 CDN：用一张确定存在的官方图
+        // 2b. 刮削第一步：真正走 /search/movie。/configuration 通不代表搜索能返回条目，
+        // 更不代表批量几百条不会 429。这一项把「请求失败」和「0 命中」分开报。
+        val (searchOk, searchDetail) = TmdbSource.probeSearch(settings)
+        items += Item("TMDB 搜索（刮削第一步）", searchOk, searchDetail)
+
+        // 3. 海报 CDN：用一张确定存在的官方图。
+        // Http 的图片拦截器会在配了反代前缀时自动改写这个 URL，所以这里
+        // 实测的就是「用户填的那个地址」通不通，不用另写一份探测逻辑。
+        val proxy = settings.imageBaseUrl.trim()
         val (imgCode, _) = Http.getWithStatus("https://image.tmdb.org/t/p/w92/wwemzKWzjKYJFfCeiB57q3r4Bcm.png")
         items += Item(
             "TMDB 海报 CDN",
             imgCode in 200..299,
+            buildString {
+                append(
+                    when {
+                        imgCode in 200..299 -> "正常"
+                        imgCode == 0 -> "连不上（SNI 阻断的典型表现，DNS 正常也白搭）"
+                        else -> "HTTP $imgCode"
+                    },
+                )
+                append(if (proxy.isBlank()) "；未配置反代" else "；已走反代 $proxy")
+                if (imgCode !in 200..299 && proxy.isBlank()) {
+                    append("。可开启「豆瓣海报优先」，或在「图片反代前缀」填入可达地址")
+                }
+            },
+        )
+
+        // 3b. 豆瓣图片 CDN：豆瓣海报兜底依赖它可达；裸请求会被 418 拦，
+        // 图片拦截器会补 UA/Referer，这里验证的就是实际加载路径。
+        val (dbImgCode, _) = Http.getWithStatus(
+            "https://img9.doubanio.com/view/photo/s_ratio_poster/public/p480747492.webp",
+        )
+        items += Item(
+            "豆瓣图片 CDN",
+            dbImgCode in 200..299,
             when {
-                imgCode in 200..299 -> "正常"
-                imgCode == 0 -> "连不上（SNI 阻断的典型表现，DNS 正常也白搭）"
-                else -> "HTTP $imgCode"
+                dbImgCode in 200..299 -> "正常（豆瓣海报兜底可用）"
+                dbImgCode == 0 -> "连不上"
+                else -> "HTTP $dbImgCode（418 = 反爬拦截）"
             },
         )
 

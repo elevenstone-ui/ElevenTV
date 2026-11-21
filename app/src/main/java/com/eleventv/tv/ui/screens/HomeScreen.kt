@@ -59,6 +59,8 @@ fun HomeScreen(
     onOpenTitle: (TitleSummary) -> Unit,
     onViewAll: (MediaKind) -> Unit,
     onScan: () -> Unit,
+    /** 停止当前扫描；库为空时的整页进度上会显示「停止扫描」 */
+    onStopScan: () -> Unit,
     onScrape: () -> Unit,
     onAddServer: () -> Unit,
     modifier: Modifier = Modifier,
@@ -108,7 +110,7 @@ fun HomeScreen(
             )
 
             // 有服务器但库是空的：扫描中显示进度，否则给扫描入口
-            libraryEmpty && scanning.status == JobStatus.Running -> ScanProgressView(scanning)
+            libraryEmpty && scanning.status == JobStatus.Running -> ScanProgressView(scanning, onStopScan)
 
             libraryEmpty -> StateView(
                 // 上一次扫描失败时必须把原因说出来。只写「媒体库是空的」，用户会以为
@@ -160,7 +162,7 @@ fun HomeScreen(
 
 /** 扫描中的整页进度（库为空时没有列表可看，进度就是唯一的反馈） */
 @Composable
-private fun ScanProgressView(job: JobState) {
+private fun ScanProgressView(job: JobState, onStopScan: () -> Unit) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator(color = C.Mint, strokeWidth = 2.dp, modifier = Modifier.size(32.dp))
@@ -177,6 +179,15 @@ private fun ScanProgressView(job: JobState) {
                 VSpace(D.Sm)
                 TvText("已扫描 ${job.current} 个文件", style = T.Caption, color = C.Text3)
             }
+            // 库为空时这页没有任何其它可点的东西：不给停止入口，一次扫错目录
+            // 就只能在电视上干等。这里必须是可聚焦、可点击的按钮（不用 loading）。
+            VSpace(D.Xl)
+            TvButton(
+                onClick = onStopScan,
+                label = "停止扫描",
+                icon = R.drawable.ic_close,
+                variant = TvButtonVariant.Ghost,
+            )
         }
     }
 }

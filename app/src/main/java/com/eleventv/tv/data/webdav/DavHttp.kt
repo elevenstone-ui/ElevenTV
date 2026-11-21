@@ -1,13 +1,16 @@
 package com.eleventv.tv.data.webdav
 
-import java.io.ByteArrayOutputStream
+import okhttp3.ConnectionPool
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
-import java.io.InputStream
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.URI
-import javax.net.ssl.SSLSocket
-import javax.net.ssl.SSLSocketFactory
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLHandshakeException
 
 /** 一次 HTTP 响应。头名统一小写，避免 `Content-Length` / `content-length` 两种写法各查一遍 */
 internal class DavResponse(
@@ -17,37 +20,43 @@ internal class DavResponse(
 )
 
 /**
- * 原始 Socket 上的最小 HTTP/1.1 客户端。
+ * WebDAV 的 PROPFIND 传输层。
  *
- * ## 为什么必须自己写
+ * ## 为什么换成 OkHttp
  *
- * `PROPFIND` 是 WebDAV 的核心方法，但**安卓自带的 `HttpURLConnection` 发不出去**：
- * 它的 `setRequestMethod` 是一个硬编码白名单，遇到别的方法直接抛
+ * 旧实现在裸 Socket 上一次连接一个请求 + `Connection: close`。扫描目录树时每个目录
+ * 都要重新 TCP 握手（HTTPS 还各做一次 TLS 握手），几百个目录就是几百次串行 RTT，
+ * 这是 WebDAV 扫描慢的主因。旧文件注释里「本项目缓存里没有 OkHttp，手写更划算」的前提
+ * 并不成立：`app/build.gradle.kts` 已声明 `implementation(libs.okhttp)`，
+ * `data/scrape/Http.kt` 也一直在用它。此处复用项目已有依赖，不新增任何依赖或技术栈。
  *
- * ```
- * ProtocolException: Expected one of [OPTIONS, GET, HEAD, POST, PUT, DELETE, TRACE, PATCH]
- *                    but was PROPFIND
- * ```
+ * ## 对外契约保持不变
  *
- * 这条报错和「服务器不支持 WebDAV」长得极像，实际连一个字节都没发出去——排查时
- * 很容易往 NAS 配置上找，越找越远。
+ * - [exchange] 的签名、[DavResponse] 结构、响应头名小写约定原样保留；
+ * - 关闭自动重定向与自动重试：跳转仍由 [WebDavStorage.request] 按 Location 自己跟，
+ *   重试仍由 [WebDavStorage.list] 按 `retryable` 判定，避免双层重试改变行为；
+ * - 显式 `Accept-Encoding: identity`：旧实现不发该头，服务器按未压缩返回；
+ *   不关掉 OkHttp 的自动 gzip 会让响应体语义悄悄变化；
+ * - 把 OkHttp 包在 cause 链里的具体 IO 异常解包后原样抛出，
+ *   保证 [WebDavStorage.request] 里那串按异常类型区分的排障文案继续命中。
  *
- * OkHttp 本身允许任意方法，但它的 `HttpURLConnection` 实现是同一套白名单；要绕开就得
- * 直接依赖 OkHttp，而本项目是离线构建、缓存里没有它。一个 PROPFIND 只需要一次请求，
- * 连接复用、HTTP/2、连接池全都用不上——手写这 180 行比引入一个依赖划算。
- *
- * ## 只支持什么
- *
- * 一次连接一次请求、`Connection: close`、`Content-Length` / `chunked` / 读到 EOF 三种
- * 响应体形态、1xx 跳过、HTTPS（系统信任库，自签证书依然会抛 `SSLHandshakeException`）。
- * 不做：连接复用、重定向（由调用方按 Location 自己跟，见 [WebDavStorage]）、认证协商。
+ * 顺带去掉了逐字节 `readLine`、chunked / EOF 三套手写解析与它们的中间拷贝。
  */
 internal object DavHttp {
 
-    /** 单次响应体上限。几千集的目录 PROPFIND 也就几 MB，32MB 足够且不至于 OOM */
-    private const val MAX_BODY_BYTES = 32 * 1024 * 1024
+    /** 单次响应体上限。几千集的目录 PROPFIND 也就几 MB，16MB 足够且不至于在低端盒子 OOM */
+    private const val MAX_BODY_BYTES = 16 * 1024 * 1024
 
-    private const val MAX_HEAD_BYTES = 64 * 1024
+    private val connectionPool = ConnectionPool()
+
+    private val baseClient: OkHttpClient = OkHttpClient.Builder()
+        .connectionPool(connectionPool)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .retryOnConnectionFailure(false)
+        .build()
+
+    private val xmlMediaType = "application/xml; charset=utf-8".toMediaType()
 
     fun exchange(
         url: String,
@@ -57,156 +66,58 @@ internal object DavHttp {
         connectTimeoutMs: Int,
         readTimeoutMs: Int,
     ): DavResponse {
-        val uri = URI(url)
-        val scheme = uri.scheme?.lowercase() ?: "http"
-        val host = uri.host ?: throw IOException("URL 缺少主机名：$url")
-        val port = if (uri.port > 0) uri.port else if (scheme == "https") 443 else 80
+        // newBuilder() 共享同一个 ConnectionPool / Dispatcher，只覆盖本次超时，
+        // 因此同一目录树里的连续请求能复用已建立的连接。
+        val client = baseClient.newBuilder()
+            .connectTimeout(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .readTimeout(readTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .build()
 
-        // 请求行里的 target 必须是「已编码」的路径：davUrl 已经把中文/空格转成 %XX，
-        // 这里再走一次解码会把 %2F 之类的序列毁掉。
-        val target = buildString {
-            val path = uri.rawPath
-            append(if (path.isNullOrEmpty()) "/" else path)
-            uri.rawQuery?.let { append('?').append(it) }
+        val builder = Request.Builder().url(url)
+        for ((k, v) in headers) builder.header(k, v)
+        if (!headers.keys.any { it.equals("Accept-Encoding", ignoreCase = true) }) {
+            builder.header("Accept-Encoding", "identity")
         }
-        val hostHeader = if (uri.port > 0) "$host:$port" else host
+        builder.method(method, body?.toRequestBody(xmlMediaType))
 
-        val socket = openSocket(scheme)
-        try {
-            socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
-            socket.soTimeout = readTimeoutMs
-            (socket as? SSLSocket)?.let { ssl ->
-                // 保持主机名校验：宁可报证书错，也不要静默连到别的主机上
-                ssl.sslParameters = ssl.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
-                ssl.startHandshake()
-            }
-
-            val head = buildString {
-                append(method).append(' ').append(target).append(" HTTP/1.1\r\n")
-                append("Host: ").append(hostHeader).append("\r\n")
-                for ((k, v) in headers) {
-                    append(k).append(": ").append(v).append("\r\n")
+        return try {
+            client.newCall(builder.build()).execute().use { resp ->
+                val merged = LinkedHashMap<String, String>(resp.headers.size)
+                for (i in 0 until resp.headers.size) {
+                    val name = resp.headers.name(i).lowercase()
+                    val value = resp.headers.value(i)
+                    // 同名头按规范逗号拼接，与旧实现的 readHeaders 行为一致
+                    merged[name] = merged[name]?.let { "$it, $value" } ?: value
                 }
-                if (body != null) append("Content-Length: ").append(body.size).append("\r\n")
-                append("Connection: close\r\n\r\n")
-            }
-            socket.getOutputStream().apply {
-                write(head.toByteArray(Charsets.ISO_8859_1))
-                body?.let { write(it) }
-                flush()
-            }
-
-            val input = socket.getInputStream().buffered()
-            return readResponse(input)
-        } finally {
-            runCatching { socket.close() }
-        }
-    }
-
-    private fun openSocket(scheme: String): Socket =
-        if (scheme == "https") {
-            (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket()
-        } else {
-            Socket()
-        }
-
-    private fun readResponse(input: InputStream): DavResponse {
-        while (true) {
-            val statusLine = readLine(input) ?: throw IOException("服务器没有返回任何响应（连接被立即关闭）")
-            val code = statusLine.split(' ').getOrNull(1)?.toIntOrNull()
-                ?: throw IOException("无法解析状态行：$statusLine")
-            val headers = readHeaders(input)
-
-            // 100 Continue / 102 Processing 这类中间响应没有 body，直接读下一段
-            if (code in 100..199) continue
-
-            val body = when {
-                code == 204 || code == 304 -> ByteArray(0)
-                headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true ->
-                    readChunked(input)
-                headers["content-length"]?.toIntOrNull() != null ->
-                    readFixed(input, headers.getValue("content-length").toInt())
-                else -> readUntilEof(input)
-            }
-            return DavResponse(code, headers, body)
-        }
-    }
-
-    private fun readHeaders(input: InputStream): Map<String, String> {
-        val out = LinkedHashMap<String, String>()
-        var total = 0
-        while (true) {
-            val line = readLine(input) ?: break
-            if (line.isEmpty()) break
-            total += line.length
-            if (total > MAX_HEAD_BYTES) throw IOException("响应头超过 ${MAX_HEAD_BYTES / 1024}KB")
-            val colon = line.indexOf(':')
-            if (colon <= 0) continue
-            val name = line.substring(0, colon).trim().lowercase()
-            val value = line.substring(colon + 1).trim()
-            // 同名头按规范是逗号拼接，实际只有 Set-Cookie 会重复，这里合并即可
-            out[name] = out[name]?.let { "$it, $value" } ?: value
-        }
-        return out
-    }
-
-    /** 逐字节读到换行。响应头不大，不值得为此再包一层缓冲区 */
-    private fun readLine(input: InputStream): String? {
-        val sb = StringBuilder(64)
-        while (true) {
-            val c = input.read()
-            if (c == -1) return if (sb.isEmpty()) null else sb.toString()
-            if (c == '\n'.code) {
-                if (sb.isNotEmpty() && sb[sb.length - 1] == '\r') sb.setLength(sb.length - 1)
-                return sb.toString()
-            }
-            if (sb.length > MAX_HEAD_BYTES) throw IOException("响应行过长")
-            sb.append(c.toChar())
-        }
-    }
-
-    private fun readFixed(input: InputStream, length: Int): ByteArray {
-        if (length < 0) throw IOException("Content-Length 不合法：$length")
-        if (length > MAX_BODY_BYTES) throw IOException("响应体过大（${length / 1024 / 1024}MB）")
-        val buf = ByteArray(length)
-        var read = 0
-        while (read < length) {
-            val n = input.read(buf, read, length - read)
-            if (n == -1) throw IOException("响应提前结束：期望 $length 字节，只收到 $read")
-            read += n
-        }
-        return buf
-    }
-
-    private fun readChunked(input: InputStream): ByteArray {
-        val out = ByteArrayOutputStream(8 * 1024)
-        while (true) {
-            val sizeLine = readLine(input) ?: throw IOException("chunked 响应提前结束")
-            // chunk 扩展（`1a;foo=bar`）直接丢掉
-            val size = sizeLine.substringBefore(';').trim().toIntOrNull(16)
-                ?: throw IOException("chunk 长度不合法：$sizeLine")
-            if (size == 0) {
-                // 跳过 trailer
-                while (true) {
-                    val trailer = readLine(input) ?: break
-                    if (trailer.isEmpty()) break
+                // OkHttp 已完成响应体读取与边界判定，这里一次取出并做上限检查
+                val bytes = resp.body?.bytes() ?: ByteArray(0)
+                if (bytes.size > MAX_BODY_BYTES) {
+                    throw IOException("响应体过大，超过 ${MAX_BODY_BYTES / 1024 / 1024}MB")
                 }
-                return out.toByteArray()
+                DavResponse(resp.code, merged, bytes)
             }
-            if (out.size() + size > MAX_BODY_BYTES) throw IOException("响应体过大，超过 ${MAX_BODY_BYTES / 1024 / 1024}MB")
-            out.write(readFixed(input, size))
-            readLine(input) // 每个 chunk 后面跟一个 CRLF
+        } catch (e: IOException) {
+            throw unwrap(e)
         }
     }
 
-    private fun readUntilEof(input: InputStream): ByteArray {
-        val out = ByteArrayOutputStream(8 * 1024)
-        val buf = ByteArray(8 * 1024)
-        while (true) {
-            val n = input.read(buf)
-            if (n == -1) return out.toByteArray()
-            if (out.size() + n > MAX_BODY_BYTES) throw IOException("响应体过大，超过 ${MAX_BODY_BYTES / 1024 / 1024}MB")
-            out.write(buf, 0, n)
+    /**
+     * OkHttp 会把底层异常包在 cause 链里。调用方按
+     * SSLHandshakeException / SocketTimeoutException / ConnectException / UnknownHostException
+     * 分别给出排障文案，这里解包后原样抛出，保证那套文案继续生效。
+     */
+    private fun unwrap(e: IOException): IOException {
+        var t: Throwable? = e.cause
+        var depth = 0
+        while (t != null && depth < 8) {
+            if (t is SSLHandshakeException || t is SocketTimeoutException ||
+                t is ConnectException || t is UnknownHostException
+            ) {
+                return t
+            }
+            t = t.cause
+            depth++
         }
+        return e
     }
 }

@@ -37,6 +37,12 @@ import com.eleventv.tv.data.player.SmbDataSource
 import com.eleventv.tv.data.repo.LocalRepository
 import com.eleventv.tv.data.repo.episodeLabel
 import com.eleventv.tv.data.webdav.davRequestHeaders
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 
 /** OSD 的四种形态。 */
@@ -81,6 +87,12 @@ class PlayerState(
     initialFile: MediaFile,
     private val settings: AppSettings,
     private val onExit: () -> Unit,
+    /**
+     * 列出目标文件所在目录的文件名（suspend，内部切 IO 线程）。
+     * PlayerState 在起播前调用，按目录缓存；列目录失败/超时时退回空列表，
+     * 正片照常起播，只是没有外挂字幕。
+     */
+    private val subtitleSiblings: suspend (MediaFile) -> List<String> = { emptyList() },
     /** 在播放器里切了解码方式后回写设置：否则退出重进又回到旧值，用户以为没生效 */
     private val onDecoderChosen: (Decoder) -> Unit = {},
 ) : Player.Listener {
@@ -131,6 +143,16 @@ class PlayerState(
     var error by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * 错误页当前高亮的按钮：0=重试，1=退出。
+     *
+     * 播放页遥控器按键不走 Compose 焦点（见 [PlayerActivity.onKeyDown]），错误页的两个
+     * 按钮若不靠它驱动高亮，左右键就切不动、OK 也按不到，用户被彻底卡在错误页。
+     * 随 [error] 一起重置：start() 清 error 时也归 0。
+     */
+    var errorSelected by mutableIntStateOf(0)
+        private set
+
     var toast by mutableStateOf<String?>(null)
         private set
 
@@ -156,7 +178,38 @@ class PlayerState(
 
     // ---- 内部 ----
 
+    /**
+     * 本次媒体是否已做过「自动挑简体中文字幕」。
+     * onTracksChanged 在轨道就绪、以及我们设置 override 之后都会回调；
+     * 不先置这个标志就应用 override，会陷入「选轨→回调→再选轨」的循环。
+     * 每次 start()（换集 / 重试 / 切解码器）重置，让新文件重新自动选一次。
+     */
+    private var autoSubtitleApplied = false
+
+    /** 用户在字幕面板手动选过（含「关闭字幕」）：本次媒体不再自动干预 */
+    private var subtitleChosenByUser = false
+
     private val server = repo.serverOf(initialFile.serverId)
+
+    /** 外挂字幕列目录专用：独立于播放器，release() 时取消，避免 Activity 销毁后回调 */
+    private val subtitleScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * 按目录缓存文件名清单：同一季换集不再列目录；换到别的季目录会自动重新列。
+     * 用 ConcurrentHashMap：快速换集时会有多个 IO 协程并发查/写缓存，
+     * 普通 HashMap 并发写是未定义行为（ART 上可能损坏桶链）。
+     */
+    private val siblingCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
+    /**
+     * 必须在 [init] 之前声明：init 会立刻调用 start()，而 Kotlin 按声明顺序执行
+     * 属性初始化器。放在文件末尾的话，start() 里的 playGeneration++ 会被之后的
+     * `= 0` 初始化器清零，导致异步起播的「代际校验」永远失配、播放器不 prepare。
+     */
+    private var released = false
+
+    /** 每次 start() 递增：作废「换集 / 切解码器 / 退出前就已排队」的异步任务 */
+    private var playGeneration = 0
 
     private var player: ExoPlayer = buildPlayer()
     private val handler = Handler(Looper.getMainLooper())
@@ -169,6 +222,12 @@ class PlayerState(
             syncProgress()
             handler.postDelayed(this, TICK_MS)
         }
+    }
+
+    /** 所有「让进度同步循环活着」的路径统一走这里，避免重复或漏挂 */
+    private fun ensureTicker() {
+        handler.removeCallbacks(ticker)
+        handler.post(ticker)
     }
 
     private val mainActions: List<OsdAction> = buildList {
@@ -186,12 +245,14 @@ class PlayerState(
             error = "找不到这个文件所属的服务器配置"
         } else {
             start(file, resumePositionOf(file))
-            handler.post(ticker)
         }
     }
 
     fun release() {
         released = true
+        // 列目录可能还在 IO 线程上跑：取消掉，别让它在 Activity 销毁后
+        // 回来 post 一个 setMediaItem 到已释放的播放器上
+        subtitleScope.cancel()
         handler.removeCallbacksAndMessages(null)
         saveProgress()
         runCatching { player.release() }
@@ -214,6 +275,9 @@ class PlayerState(
         if (player.playbackState == Player.STATE_ENDED) {
             player.seekTo(0)
             player.play()
+            // ENDED 时 ticker 被摘掉，而重播不走 start()；不在这里挂回来，
+            // 进度同步、5 秒落盘、12 秒取流超时提示会一直停摆到下次换集。
+            ensureTicker()
         } else if (player.isPlaying) {
             player.pause()
         } else {
@@ -231,12 +295,6 @@ class PlayerState(
         // `coerceIn(0, 0)` 会把目标一律压成 0，按一下「前进 10 秒」反而跳回片头。
         val raw = player.currentPosition + deltaMs
         val target = if (duration > 0) raw.coerceIn(0L, duration) else raw.coerceAtLeast(0L)
-        player.seekTo(target)
-        positionMs = target
-    }
-
-    private fun seekTo(ms: Long) {
-        val target = ms.coerceIn(0L, durationMs.coerceAtLeast(0L))
         player.seekTo(target)
         positionMs = target
     }
@@ -282,7 +340,22 @@ class PlayerState(
 
     /** 出错后原地重试：不换集、不丢位置 */
     fun retry() {
+        errorSelected = 0
         start(file, positionMs)
+    }
+
+    /** 错误页：左右切换选中按钮，OK 激活。全消费，不给系统。 */
+    private fun onHorizontalError(dir: Int): Boolean {
+        errorSelected = (errorSelected + dir + 2) % 2
+        return true
+    }
+
+    /** 错误页按钮横排，上下无目标；但仍要消费掉，避免漏给系统焦点搜索。 */
+    private fun onVerticalError(dir: Int): Boolean = true
+
+    private fun onCenterError(): Boolean {
+        if (errorSelected == 0) retry() else exit()
+        return true
     }
 
     /**
@@ -311,6 +384,22 @@ class PlayerState(
      * @return true 表示已消费。返回 false 时交给系统（例如音量键）。
      */
     fun handleKey(event: KeyEvent): Boolean {
+        // 错误态：页面只剩「重试 / 退出」两个按钮，遥控器按键全在这里消化。
+        // 必须放在抬起/OSD 逻辑之前——错误时 OSD 已隐藏，方向键若走系统焦点搜索，
+        // 会去搜 Compose 焦点（本播放器按键不走焦点），按钮就永远选不动、OK 也按不到。
+        if (error != null) {
+            if (event.action != KeyEvent.ACTION_DOWN) return true
+            return when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> onHorizontalError(-1)
+                KeyEvent.KEYCODE_DPAD_RIGHT -> onHorizontalError(1)
+                KeyEvent.KEYCODE_DPAD_UP -> onVerticalError(-1)
+                KeyEvent.KEYCODE_DPAD_DOWN -> onVerticalError(1)
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER ->
+                    onCenterError()
+                else -> false
+            }
+        }
+
         // 只处理按下（含长按重复），抬起一律吞掉，避免和 DOWN 的语义重复
         if (event.action != KeyEvent.ACTION_DOWN) {
             return CONSUMED_KEYS.contains(event.keyCode)
@@ -569,6 +658,8 @@ class PlayerState(
             detail = null,
             selected = disabled || subtitleGroups.none { g -> (0 until g.length).any { g.isTrackSelected(it) } },
             onPick = {
+                // 用户主动关掉了字幕，别让自动选轨又把它打开
+                subtitleChosenByUser = true
                 player.trackSelectionParameters = player.trackSelectionParameters
                     .buildUpon()
                     .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
@@ -589,6 +680,8 @@ class PlayerState(
                     detail = format.codecs,
                     selected = !disabled && group.isTrackSelected(i),
                     onPick = {
+                        // 用户手动选了轨（哪怕是繁体），本次媒体不再自动干预
+                        subtitleChosenByUser = true
                         applyOverride(group, i)
                         closePanel()
                         showToast("字幕：$label")
@@ -716,10 +809,21 @@ class PlayerState(
 
     private fun start(target: MediaFile, startMs: Long, autoPlay: Boolean = true) {
         val srv = server ?: return
+        // 每次换片 / 重试 / 切解码器都作废旧代际，让排队中的自动重试自动失效
+        playGeneration++
         error = null
+        errorSelected = 0
         isBuffering = true
         durationMs = 0L
         positionMs = startMs
+        // 换了媒体项 / 重试 / 重建播放器，轨道都会重新就绪：允许新一轮自动选简体中文。
+        // 手动标志也必须重置：TrackSelectionOverride 是绑定具体 TrackGroup 的，
+        // 换集后旧 override 本就失效；若不重置，用户在第 1 集手动选过一次，
+        // 后面每一集都不再自动选，字幕反而整段消失。
+        // 「关闭字幕」不靠这个标志保持——它落在 trackSelectionParameters 的
+        // disabledTrackTypes 里，会跨集保留，由 onTracksChanged 再检查一次。
+        autoSubtitleApplied = false
+        subtitleChosenByUser = false
         cues = emptyList()
         bitmapCues = emptyList()
         // 旧片的宽高比不能留给新片用，否则缓冲期间会按上一部画错
@@ -739,14 +843,87 @@ class PlayerState(
             StorageProtocol.WEBDAV -> srv.davUrl(target.path).toUri()
         }
 
-        player.setMediaItem(MediaItem.fromUri(uri))
-        player.prepare()
-        if (startMs > 0L) player.seekTo(startMs)
-        player.playWhenReady = autoPlay
+        // 外挂字幕必须在 setMediaItem 之前查到（Media3 事后不能追加字幕轨），
+        // 但列目录是网络 IO，不能放主线程等。这里先同步重置完状态（UI 立刻显示
+        // buffering，不是黑屏），再在 IO 线程查一次目录，拿到结果回主线程一次起播。
+        // 换集到别的季目录会自动重新列；同目录走缓存，几乎零延迟。
+        val generation = playGeneration
+        subtitleScope.launch {
+            val siblings = siblingNamesOf(target)
+            handler.post {
+                // 用户快速换集 / 重试 / 退出时，旧一代的回调必须丢弃，
+                // 否则会把上一集的 MediaItem 设置到当前播放器上
+                if (released || generation != playGeneration) return@post
+                player.setMediaItem(buildMediaItem(srv, target, uri, siblings))
+                player.prepare()
+                if (startMs > 0L) player.seekTo(startMs)
+                player.playWhenReady = autoPlay
+            }
+        }
         // 起播/换集/重试都必须让进度同步循环活着：ticker 在「停止自动连播的 ENDED」
         // 与 switchDecoder 里被摘除过，这里重新挂上，保证 5s 落盘 + 缓冲超时提示始终可用
-        handler.removeCallbacks(ticker)
-        handler.post(ticker)
+        ensureTicker()
+    }
+
+    /**
+     * 按目录取文件名清单，带缓存与硬超时。
+     * NAS 慢或列目录失败时返回空列表：正片照常起播，只是没有外挂字幕，
+     * 绝不让"找字幕"拖住播放。
+     */
+    private suspend fun siblingNamesOf(target: MediaFile): List<String> {
+        val dir = target.path.substringBeforeLast('/', "")
+        siblingCache[dir]?.let { return it }
+        val names = withTimeoutOrNull(SUBTITLE_SCAN_TIMEOUT_MS) {
+            runCatching { subtitleSiblings(target) }
+                .onFailure { Log.w(TAG, "外挂字幕列目录失败：${it.message}") }
+                .getOrDefault(emptyList())
+        } ?: emptyList<String>().also {
+            Log.w(TAG, "外挂字幕列目录超时（${SUBTITLE_SCAN_TIMEOUT_MS}ms），跳过")
+        }
+        siblingCache[dir] = names
+        return names
+    }
+
+    /**
+     * 构造 MediaItem，并挂上同目录的外挂字幕。
+     *
+     * 字幕必须在 setMediaItem 时一次带上：Media3 事后没有「追加字幕轨」的公开 API，
+     * 重新 setMediaItem 会重新 prepare、画面黑一下、播放位置也可能丢。
+     *
+     * 不设 SELECTION_FLAG_DEFAULT：挂上去的轨交给 onTracksChanged 的
+     * 自动选简中逻辑统一挑，避免「默认选中第一条」把繁体轨顶到前面。
+     */
+    private fun buildMediaItem(
+        srv: com.eleventv.tv.data.model.SmbServer,
+        target: MediaFile,
+        videoUri: android.net.Uri,
+        siblings: List<String>,
+    ): MediaItem {
+        val matched = matchExternalSubtitles(target.fileName, siblings)
+        if (matched.isEmpty()) return MediaItem.fromUri(videoUri)
+
+        val dir = target.path.substringBeforeLast('/', "")
+        val configs = matched.map { sub ->
+            val subPath = if (dir.isEmpty()) sub.fileName else "$dir/${sub.fileName}"
+            val subUri = when (srv.protocol) {
+                StorageProtocol.SMB -> android.net.Uri.Builder()
+                    .scheme("smb")
+                    .authority(srv.id)
+                    .path(subPath)
+                    .build()
+                StorageProtocol.WEBDAV -> srv.davUrl(subPath).toUri()
+            }
+            MediaItem.SubtitleConfiguration.Builder(subUri)
+                .setMimeType(sub.mimeType)
+                .setLanguage(sub.language)
+                .setLabel(sub.label)
+                .build()
+        }
+        Log.i(TAG, "挂载 ${configs.size} 条外挂字幕：${matched.map { it.fileName }}")
+        return MediaItem.Builder()
+            .setUri(videoUri)
+            .setSubtitleConfigurations(configs)
+            .build()
     }
 
     private fun resumePositionOf(target: MediaFile): Long {
@@ -759,7 +936,11 @@ class PlayerState(
     }
 
     private fun saveProgress() {
-        val duration = durationMs.takeIf { it > 0 } ?: player.duration.takeIf { it > 0 } ?: return
+        // 容器没有时长（TS / m2ts / 部分 ISO）时 duration 记 0 也要把位置落盘，
+        // 否则这类片源的续播完全失效；repo 与 PlaybackRecord 已按 0 时长兜底。
+        val duration = durationMs.takeIf { it > 0 }
+            ?: player.duration.takeIf { it > 0 && it != C.TIME_UNSET }
+            ?: 0L
         val position = player.currentPosition.takeIf { it > 0 } ?: positionMs
         if (position <= 0) return
         repo.saveProgress(entry.id, file, position, duration)
@@ -845,10 +1026,57 @@ class PlayerState(
     /** 当前这条错误是「缓冲太久」推断出来的（不是播放器报的），画面恢复后可以撤掉 */
     private var errorFromStall = false
 
-    /** Activity 已销毁：延迟任务不该再碰播放器 */
-    private var released = false
+    // 注：released / playGeneration 声明在上方「内部字段区」（init 之前）。
+    // Kotlin 按声明顺序执行初始化器：若放在 init 之后，init 里 start() 的自增
+    // 会被后面的 `= 0` 初始化器清零，异步起播的代际校验就会永久失配。
 
     // ---------------- Player.Listener ----------------
+
+    /**
+     * 轨道就绪时自动选中简体中文字幕。
+     *
+     * ## 为什么不用 setPreferredTextLanguage("zh")
+     * MKV 里简体/繁体字幕的 language 常常都写成 `chi`/`zho`/`zh`，语言字段
+     * 区分不了简繁，Media3 只会按顺序取第一条中文轨——结果经常默认落到繁体。
+     * 所以按 label + language 给每条文本轨打分，用 override 精确锁定最优简体轨。
+     *
+     * ## 为什么在这里而不是 start()
+     * setMediaItem/prepare 时轨道还没解析出来，start() 里读 currentTracks 只会拿到
+     * 空集合；onTracksChanged 是轨道真正就绪的标准时机。
+     *
+     * ## 回调循环
+     * 下面写 trackSelectionParameters 会再次触发 onTracksChanged，所以必须
+     * **先**把 autoSubtitleApplied 置 true 再写，否则会无限「选轨→回调→再选轨」。
+     */
+    override fun onTracksChanged(tracks: Tracks) {
+        if (autoSubtitleApplied || subtitleChosenByUser) return
+        val textGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }
+        if (textGroups.isEmpty()) return
+        // 用户主动关过字幕：disabledTrackTypes 会跨集保留，尊重这个意图，
+        // 别让自动选轨通过 applyOverride 的 setTrackTypeDisabled(false) 又把它打开。
+        if (player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)) return
+        autoSubtitleApplied = true
+
+        var bestGroup: Tracks.Group? = null
+        var bestIndex = -1
+        var bestScore = 0
+        for (group in textGroups) {
+            for (i in 0 until group.length) {
+                if (!group.isTrackSupported(i)) continue
+                val format = group.getTrackFormat(i)
+                val score = simplifiedChineseScore(format.label, format.language)
+                if (score > bestScore) {
+                    bestScore = score
+                    bestGroup = group
+                    bestIndex = i
+                }
+            }
+        }
+        // 没有简体中文字幕：保持 Media3 默认，不强行开英文字幕
+        val target = bestGroup ?: return
+        applyOverride(target, bestIndex)
+        Log.i(TAG, "自动选中简体中文字幕轨（score=$bestScore, track=$bestIndex）")
+    }
 
     override fun onPlaybackStateChanged(playbackState: Int) {
         if (playbackState == Player.STATE_READY) {
@@ -902,7 +1130,8 @@ class PlayerState(
             cue.text?.toString()?.takeIf { it.isNotBlank() }?.let { texts += it }
             cue.bitmap?.let { bitmaps += it }
         }
-        cues = texts
+        // 内容不变时不赋新引用，避免字幕层无谓重组
+        if (texts != cues) cues = texts
         if (bitmaps != bitmapCues) bitmapCues = bitmaps
     }
 
@@ -918,8 +1147,13 @@ class PlayerState(
             e.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
         if (recoverable && !autoRetried && !released) {
             autoRetried = true
+            val generation = playGeneration
             Log.w(TAG, "取流失败，1 秒后自动重试一次：${e.message}")
-            handler.postDelayed({ if (!released && error == null) retry() }, AUTO_RETRY_DELAY_MS)
+            handler.postDelayed({
+                // 静置期内用户可能已换集或切了解码器（start 会让 generation 递增），
+                // 此时不能再拿新的 file / position 去 retry，否则打断用户刚发起的操作。
+                if (!released && error == null && generation == playGeneration) retry()
+            }, AUTO_RETRY_DELAY_MS)
             return
         }
 
@@ -970,6 +1204,13 @@ class PlayerState(
         const val SEEK_HIDE_MS = 6_000L
         const val SEEK_STEP = 10_000L
         const val TAG = "ElevenTV"
+
+        /**
+         * 外挂字幕列目录的硬超时。局域网 SMB/WebDAV 一次列目录通常几十毫秒；
+         * 超时就按「没有外挂字幕」起播，绝不让找字幕拖住正片。
+         * 期间 UI 是 buffering 态而不是黑屏，用户仍能看到加载反馈。
+         */
+        const val SUBTITLE_SCAN_TIMEOUT_MS = 1_200L
 
         /** 可信的显示宽高比区间：超出这个范围一定是解码器给的脏数据 */
         val ASPECT_SANE_RANGE = 0.2f..6f

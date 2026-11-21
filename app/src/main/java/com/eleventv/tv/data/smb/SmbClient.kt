@@ -425,10 +425,29 @@ class SmbPool {
         slots[key]?.let { retire(key, it) }
     }
 
+    /**
+     * 关闭全部连接。
+     *
+     * 原来直接遍历关掉，会打断正在 use() / SmbDataSource.read() 的线程：播放中的连接
+     * 被 close 后读操作立刻抛异常。这里按 key 持锁、只关空闲连接；仍忙的标记 retired
+     * 放进 zombies，等它空闲时由 sweep / closeIfIdle 收掉。
+     */
     fun closeAll() {
-        (slots.values + zombies).forEach { runCatching { it.connection.close() } }
-        slots.clear()
-        zombies.clear()
+        slots.toList().forEach { (key, slot) ->
+            synchronized(lockOf(key)) {
+                slot.retired = true
+                slots.remove(key, slot)
+                if (slot.busy()) {
+                    zombies += slot
+                    Log.i(TAG, "连接仍在使用，延迟关闭：$key")
+                } else {
+                    zombies.remove(slot)
+                    runCatching { slot.connection.close() }
+                }
+            }
+        }
+        // 原本就在等空闲的僵尸连接，能关的现在一并关掉
+        zombies.toList().forEach { closeIfIdle(it) }
     }
 
     /**

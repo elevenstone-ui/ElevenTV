@@ -30,6 +30,13 @@ class ElevenApp : Application() {
         repository = LocalRepository(filesDir, appScope)
         appScope.launch { repository.init() }
 
+        // 图片反代前缀跟着设置走：改完设置页立刻生效，不用重启、不用重刮。
+        // collect 会先发一次当前值（含刚从 settings.json 读出的旧配置），
+        // 所以冷启动首屏也用得上。
+        appScope.launch {
+            repository.settings.collect { Http.imageBaseUrl = it.imageBaseUrl }
+        }
+
         // 海报域名与刮削必须共用同一个客户端（共用 DoH 解析缓存），
         // 否则刮削拿到了海报地址、列表却一片灰。
         Coil.setImageLoader(

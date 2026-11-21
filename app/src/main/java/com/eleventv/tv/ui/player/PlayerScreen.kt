@@ -44,12 +44,13 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.util.UnstableApi
 import com.eleventv.tv.R
-import com.eleventv.tv.data.repo.episodeLabel
+import com.eleventv.tv.data.repo.episodeNumberLabel
 import com.eleventv.tv.ui.components.StateView
 import com.eleventv.tv.ui.components.TvButton
 import com.eleventv.tv.ui.components.TvButtonVariant
@@ -155,18 +156,22 @@ fun PlayerScreen(state: PlayerState, modifier: Modifier = Modifier) {
                 description = message,
                 iconRes = R.drawable.ic_alert,
                 action = {
+                    // 遥控器按键不走 Compose 焦点（PlayerActivity.onKeyDown 全交给 state.handleKey），
+                    // 所以高亮由 state.errorSelected 驱动，左右键切、OK 激活都在 PlayerState 里处理。
                     Row(horizontalArrangement = Arrangement.spacedBy(D.Lg)) {
                         TvButton(
                             onClick = { state.retry() },
                             label = "重试",
                             icon = R.drawable.ic_refresh,
                             variant = TvButtonVariant.Primary,
+                            highlighted = state.errorSelected == 0,
                         )
                         TvButton(
                             onClick = { state.exit() },
                             label = "退出",
                             icon = R.drawable.ic_close,
                             variant = TvButtonVariant.Ghost,
+                            highlighted = state.errorSelected == 1,
                         )
                     }
                 },
@@ -293,12 +298,40 @@ private fun TopBar(state: PlayerState) {
             modifier = Modifier.size(16.dp),
         )
         Column(Modifier.weight(1f)) {
-            TvText(state.seriesTitle, style = T.Title1, color = C.Text1, maxLines = 1)
+            // 剧名 + 单集名并排：单集名（episodeTitle）紧跟在剧名后，空间不足时单集名省略。
+            // 电影没有单集名：isMovie 时只显示剧名，不挂 E1 / 「第 1 集」这种无意义尾巴。
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(D.Md),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                TvText(
+                    text = state.seriesTitle,
+                    style = T.Title1,
+                    color = C.Text1,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (!state.isMovie) {
+                    val epName = state.file.episodeTitle?.takeIf { it.isNotBlank() }
+                        ?: "第 ${state.file.episodeNumber} 集"
+                    TvText(
+                        text = epName,
+                        style = T.Title1,
+                        color = C.Text2,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                }
+            }
             TvText(
                 text = buildString {
                     // 电影没有集号：以前只看 seasonNumber > 0（默认值就是 1，恒真），
                     // 于是电影顶栏永远挂着「E1 · 4K · 解码：自动」
-                    if (!state.isMovie) append(state.file.episodeLabel())
+                    // 第二行只放纯集号角标：单集标题已并排在上面一行（剧名后面），
+                    // 走 episodeLabel() 会连标题一起再显示一遍。
+                    if (!state.isMovie) append(state.file.episodeNumberLabel())
                     state.file.quality?.let {
                         if (isNotEmpty()) append(" · ")
                         append(it)

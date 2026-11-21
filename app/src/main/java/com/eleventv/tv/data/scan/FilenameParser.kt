@@ -95,9 +95,43 @@ object FilenameParser {
             """ova|oad|ncop|nced|featurette|trailer|sample|""" +
             """proper|repack|extended|uncut|complete|collection)\b""",
     )
+    /**
+     * 候选集号：文件名**任意位置**的 1–3 位数字（`xxx01xxx` 也能提出来）。
+     *
+     * 必须先剥掉已知噪音，否则 `Movie.2019.1080p.x264.mkv` 会提出
+     * 2019 / 1080 / 264 一堆假集号。被剥的：4 位年份、分辨率、编码/音轨、
+     * 季集标记（S01E02 由 SE 正则单独处理）、普通方括号组。
+     *
+     * **例外**：方括号里是纯 1–3 位数字时（`[04]`/`[06]`）要保留 —— 字幕组
+     * 的标准分集写法，整组剥掉会让这类剧集全变成一堆独立「电影」。
+     * `[2019]` 是 4 位、`[1080P]` 不是纯数字，都不会被误当集号。
+     *
+     * 返回值保留「数字」，交给 [Scanner] 用「同目录是否成序列」来判定，
+     * 单看一个文件无法区分 `01` 是集号还是片名里的数字。
+     */
+    fun episodeNumbersInName(fileName: String): List<Int> {
+        val base = fileName.substringBeforeLast('.')
+        val bracketNumbers = BRACKET_NUMBER.findAll(base)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .filter { it in 1..999 }
+            .toList()
+        var s = BRACKETS.replace(base, " ")
+        s = NOISE.replace(s, " ")
+        s = Regex("""(?i)\b(?:19|20)\d{2}\b""").replace(s, " ")   // 年份
+        s = Regex("""(?i)\b(?:2160p?|1080p?|720p?|480p?|4k|uhd|fhd)\b""").replace(s, " ")
+        s = Regex("""(?i)\bs\d{1,2}e\d{1,4}\b""").replace(s, " ") // 已有季集标记
+        s = Regex("""(?i)\b(?:ep|episode|第)\s*\d{1,4}\s*[集话話期]?\b""").replace(s, " ")
+        val fromText = Regex("""(?<![0-9])(\d{1,3})(?![0-9])""").findAll(s)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .filter { it in 1..999 }
+        return (bracketNumbers + fromText).distinct().sorted()
+    }
+
     /** 动漫目录：字幕组常用绝对集号，裸数字在这里可信 */
     private val ANIME_PATH = Regex("""(?i)(动漫|动画|番剧|新番|anime|animation)""")
     private val BRACKETS = Regex("""[\[\(\{【（][^\[\]\(\)\{\}【】（）]*[\]\)\}】）]""")
+    /** 纯数字的方括号组：字幕组标准集号写法 `[04]` / `[06]` / `【12】` */
+    private val BRACKET_NUMBER = Regex("""[\[\(\{【（]\s*(\d{1,3})\s*[\]\)\}】）]""")
     private val SEPARATORS = Regex("""[._+\-–—|/\\]+""")
     private val SPACES = Regex("""\s+""")
     /** 结尾的 "-GROUP" 发布组标记 */
@@ -142,6 +176,18 @@ object FilenameParser {
         fileName: String,
         relPath: String = "",
         numericEpisode: Boolean = false,
+        /**
+         * 由 [Scanner] 判定的「本文件在该剧集里的集号」。
+         * 数字可能在文件名任意位置（`xxx01xxx`），解析端自己找会挑错，
+         * 所以由统计端算好传入，保证判定与赋值用的是同一个数字。
+         */
+        numericEpisodeNumber: Int? = null,
+        /**
+         * 该文件所在目录里的视频文件总数。≥2 说明是「合集/导演文件夹」
+         * （一个目录装多部不同电影），此时目录名是分类而非片名，
+         * [movieTitleFromPath] 弃用它、回落到文件名。
+         */
+        sameDirVideoFiles: Int = 1,
     ): ParsedName {
         val base = fileName.substringBeforeLast('.')
         val pathText = relPath.lowercase()
@@ -245,12 +291,18 @@ object FilenameParser {
         // 目录里全是 01/02/03 这种命名（[Scanner] 统计同目录兄弟文件后判定）。
         // 到这一步文件名已经证明自己没有季集标记，开头的数字就是集号；
         // `01 婚礼.mkv` 这种还能顺带把单集标题取出来。
-        if (episode == null && numericEpisode) {
+        if (episode == null && numericEpisodeNumber != null) {
+            // 集号来自「目录内数字成序列」的统计，数字可能嵌在文件名中间
+            // （`xxx01xxx`）。剧名完全交给目录名，不尝试截单集标题。
+            episode = numericEpisodeNumber
+            titlePart = ""
+            episodeEnd = null
+        } else if (episode == null && numericEpisode) {
+            // 兼容旧路径：文件名以编号开头（`01 婚礼.mkv`），顺带取出单集标题
             val digits = base.takeWhile { it.isDigit() }
             val n = digits.takeIf { it.length in 1..3 }?.toIntOrNull()
             if (n != null && n in 1..999) {
                 episode = n
-                // 文件名里只有编号，剧名完全由目录提供
                 titlePart = ""
                 var end = digits.length
                 while (end < base.length && base[end] in " ._-") end++
@@ -294,6 +346,13 @@ object FilenameParser {
         val rawTitle = cleanTitle(titlePart)
 
         var title = stripSeasonAndYear(rawTitle)
+        // 电影优先用目录名：NAS 上常见 `/电影/片名 (2019)/片名.2019.1080p.AMZN.KyoGo.mkv`，
+        // 目录名比文件名干净得多，而文件名里的年份/片源/压制组会把 TMDB 搜索整串拖成 0 命中。
+        // 剧集不动：它的片名本来就从目录名来，且 mergeKey 依赖归一化剧名（红线）。
+        // 电影的 mergeKey 是 `file|relPath`（只用路径），改标题不影响 stableId 与播放记录。
+        if (episode == null) {
+            movieTitleFromPath(relPath, sameDirVideoFiles)?.let { title = it }
+        }
         // 只对「空 / 纯数字」回落到目录名，**不再因为太短就回落**：
         // 《X》《9》这类短剧名原先被长度检查驳回，`/动漫/X/OVA/` 里顶上来的
         // 就是 `OVA`，整部剧被拆成「X」和「OVA」两条。
@@ -483,6 +542,49 @@ object FilenameParser {
             if (cleaned.any { it.isLetter() }) return cleaned
         }
         return null
+    }
+
+    /**
+     * 电影专用：只看「离文件最近的那一级目录」当片名。
+     *
+     * ## 为什么只看一级
+     *
+     * relPath 是从用户配置的扫描根拼出来的（`/Multimedia/Movie/片名.mkv`）。
+     * 剧集版 [seriesTitleFromPath] 会一路往上找，遇到「电影直接散放在根目录」
+     * 就会把 `Movie` 甚至共享名 `Multimedia` 当成片名 —— 而根名是用户自己填的，
+     * 无法靠词表穷举。只看最近一级最稳：`/电影/片名 (2019)/xxx.mkv` 取到片名，
+     * `/电影/片名.mkv` 取到 `电影`（容器）→ 判掉 → 回落文件名，两种情况都对。
+     *
+     * 括号组先剥掉：`片名 (2019)` → `片名`，否则年份会留在搜索词里。
+     */
+    /**
+     * 对外暴露的「最近一级目录名」：供 [com.eleventv.tv.data.scrape.Scraper] 在刮削时现算。
+     *
+     * `LibraryEntry.rawTitle` 是扫描时算好存进 library.json 的；用户装了新解析规则
+     * 但还没重新扫描时，它仍是旧的文件名标题。刮削阶段从这里按路径现算目录名，
+     * 「电影优先目录名」就不依赖重新扫描也能生效。
+     */
+    fun directoryTitle(relPath: String, sameDirVideoFiles: Int = 1): String? =
+        movieTitleFromPath(relPath, sameDirVideoFiles)
+
+    private fun movieTitleFromPath(relPath: String, sameDirVideoFiles: Int = 1): String? {
+        val parent = relPath.substringBeforeLast('/', "").substringAfterLast('/').trim()
+        if (parent.isEmpty()) return null
+        if (parent.lowercase() in CONTAINER_DIRS) return null
+        if (SEASON_DIR.matches(parent) || CN_SEASON_DIR.matches(parent)) return null
+        if (parent.all { it.isDigit() }) return null
+        if (DISC_DIR.matches(parent)) return null
+        if (isEpisodeDirName(parent)) return null
+        // 「一个目录装多部不同电影」的合集/导演文件夹（/电影/宫崎骏系列/千与千寻.mkv）：
+        // 目录名是分类而不是片名。之前拿它当片名，会把整批电影都搜成同一个词
+        // （"宫崎骏系列"），TMDB 模糊命中到某部不相关的片（如久石让演唱会），
+        // 于是几十部宫崎骏全显示成同一部。判据：该目录里的视频文件数 ≥ 2 →
+        // 目录名弃用、回落到「每部影片自己的文件名」。单片文件夹（=1）不受影响。
+        if (sameDirVideoFiles >= 2) return null
+        val noBrackets = BRACKETS.replace(parent, " ").trim()
+        if (noBrackets.isBlank()) return null
+        val cleaned = stripSeasonAndYear(cleanTitle(noBrackets))
+        return cleaned.takeIf { it.length >= 2 && it.any { c -> c.isLetter() } }
     }
 
     /**

@@ -35,6 +35,9 @@ enum class TvButtonVariant { Primary, Ghost, Icon }
  * @param loading 加载中：图标换成 spinner，禁用点击但**保持可聚焦**——
  *   焦点在加载中被挤走，用户会以为界面卡死。
  * @param enabled false 时 40% 不透明且不可聚焦。
+ * @param highlighted 外部状态直接点亮焦点环（不走 Compose 焦点）。
+ *   给遥控器按键由 Activity 分发、方向键到不了 Compose 焦点系统的页面用
+ *   （典型：播放器错误页）；焦点视觉仍统一走 [focusRing]，这里只透传布尔。
  */
 @Composable
 fun TvButton(
@@ -46,6 +49,7 @@ fun TvButton(
     enabled: Boolean = true,
     loading: Boolean = false,
     contentDescription: String? = null,
+    highlighted: Boolean = false,
 ) {
     val bg = when (variant) {
         TvButtonVariant.Primary -> C.Text1
@@ -75,6 +79,7 @@ fun TvButton(
                 scale = 1.04f,
                 shape = CircleShape,
                 enabled = enabled,
+                highlighted = highlighted,
             )
             .padding(horizontal = if (variant == TvButtonVariant.Icon) D.Lg else D.ButtonPadH)
             .semantics { if (contentDescription != null) this.contentDescription = contentDescription },
