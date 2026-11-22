@@ -58,8 +58,8 @@
 - **目标系统**：Android 15（API 36）
 - **形态**：Android TV / Leanback，横屏固定
 - **数据来源**：TMDB（未获认可或认证）+ Fanart.tv；两者署名见设置页「关于」
-- **构建**：自用签名证书，release 与 debug 包签名不同不互通；本目录 2.1.35 提供 debug 包（`ElevenTV-2.1.35-webdav-debug.apk`），2.1.12 保留 release 包（`ElevenTV-2.1.12-webdav-release.apk`），两代签名不互通、不可覆盖安装，需先卸载旧版
-- **源码**：见本目录「ElevenTV-2.1.35-webdav-src.zip」（历史包「ElevenTV-2.0 源码包.zip」为 2.1.12，保留不删）
+- **构建**：自用签名证书，release 与 debug 包签名不同不互通；本目录提供 2.1.35 的 debug 包（`ElevenTV-2.1.35-webdav-debug.apk`）
+- **源码**：见本目录「ElevenTV-2.1.35-webdav-src.zip」
 - **UI 设计稿**：`ElevenTV-UI.html`（3840×2160 1:1，含 Logo 系统 / 视觉规范 / 5 个核心界面）
 
 ## 更新记录（节选）
