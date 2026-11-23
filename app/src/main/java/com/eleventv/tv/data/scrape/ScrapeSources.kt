@@ -466,11 +466,17 @@ object TmdbSource {
                 }
             }
 
+            // number_of_episodes 对在播剧/部分剧常为 0 或缺失（豆瓣的 episodes_count 也多数拿不到），
+            // 会让详情页「共 N 集」整个消失、只剩「库里 M 集」。这里用上面已抓到的每季集数求和兜底
+            // ——季详情本来就逐季拉了 episodes 数组，免费拿到长度，不用额外发请求。
+            val totalEpisodes = result.totalEpisodes
+                ?: seasonCounts.values.sum().takeIf { it > 0 }
             result = result.copy(
                 seasonOverviews = overviews,
                 seasonPosters = posters,
                 episodes = episodes,
                 seasonEpisodeCounts = seasonCounts,
+                totalEpisodes = totalEpisodes,
             )
         }
 

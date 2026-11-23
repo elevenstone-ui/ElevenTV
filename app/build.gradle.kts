@@ -48,8 +48,8 @@ android {
         // A9F 出厂 Android 8.0（API 26）；26 起自适应图标可用
         minSdk = 26
         targetSdk = 36
-        versionCode = 39
-        versionName = "2.1.35-webdav"
+        versionCode = 40
+        versionName = "2.1.36-webdav"
 
         buildConfigField("String", "TMDB_API_KEY", "\"$tmdbApiKey\"")
         buildConfigField("String", "TMDB_READ_TOKEN", "\"$tmdbReadToken\"")
